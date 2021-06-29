@@ -185,6 +185,27 @@ public:
 private:
 };
 
+template<typename Visitor, typename R=void>
+R visit(Visitor&& v, AttributeValue& val)
+{
+	switch (val.data_type)
+	{
+	case AttributeType::type_bool: return v(val.data.b); break;
+	case AttributeType::type_u8:   return v(val.data.u8); break;
+	case AttributeType::type_s8:   return v(val.data.s8); break;
+	case AttributeType::type_u16:  return v(val.data.u16); break;
+	case AttributeType::type_s16:  return v(val.data.s16); break;
+	case AttributeType::type_f32:  return v(val.data.f32); break;
+	case AttributeType::type_u32:  return v(val.data.u32); break;
+	case AttributeType::type_s32:  return v(val.data.s32); break;
+	case AttributeType::type_f64: 
+		return v(val.data.f64); break;
+	case AttributeType::type_u64:  return v(val.data.u64); break;
+	case AttributeType::type_s64:  return v(val.data.s64); break;
+	case AttributeType::type_string: return v(val.data.s); break;
+	}
+}
+
 /**
  A record of a log entry
  */
@@ -402,7 +423,7 @@ struct AllocBackEnd
 		{
 			buff[k] = (char*)malloc(size[k] * 200);
 			int* p = (int*)buff[k];
-			assert(p != 0);
+			//assert(p != 0);
 			for (int i = 0; i < 200; i++)
 			{
 				p[i * size[k] / sizeof(int)] = i + 1;
@@ -859,6 +880,8 @@ public:
 
 			rec.add_attribute(name, attr);
 		}
+
+		return true;
 	}
 
 private:

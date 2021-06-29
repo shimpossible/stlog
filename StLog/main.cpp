@@ -1,4 +1,3 @@
-#include "Logger.h"
 #include <process.h>
 #include "LogRecord.h"
 #include <process.h>
@@ -23,6 +22,60 @@ void test_RingBuffer()
 	}
 }
 
+struct AttrPrinter
+{
+	void operator()(bool b) 
+	{
+		printf("%d", b);
+	}
+
+	void operator()(float b)
+	{
+		printf("%f", b);
+	}
+	void operator()(double b)
+	{
+		printf("%lf", b);
+	}
+	void operator()(int8_t b)
+	{
+		printf("%d", b);
+	}
+	void operator()(int16_t b)
+	{
+		printf("%d", b);
+	}
+	void operator()(int32_t b)
+	{
+		printf("%d", b);
+	}
+	void operator()(int64_t b) 
+	{
+		printf("%d", b);
+	}
+
+	void operator()(uint8_t b) 
+	{
+		printf("%u", b);
+	}
+	void operator()(uint16_t b) 
+	{
+		printf("%u", b);
+	}
+	void operator()(uint32_t b) 
+	{
+		printf("%u", b);
+	}
+	void operator()(uint64_t b) 
+	{
+		printf("%llu", b);
+	}
+
+	void operator()(Span<const char> b)
+	{
+		printf("%.*s", b.len, b.data);
+	}
+};
 SimpleLogExporter* e;
 void ReadThread(void* )
 {
@@ -32,17 +85,16 @@ void ReadThread(void* )
 		bool b1 = e->read_record(slr);
 		if (b1)
 		{
+			printf("%llu ", slr.ts);
+			printf("%04x ", slr.severity);
 			printf("%.*s - ", slr.message.len, slr.message.data);
 			for (auto it = slr.m_attrs.begin();
 				it != slr.m_attrs.end();
 				it++)
 			{
-				printf("\n\t%s :", it->first.c_str());
-				switch (it->second.data_type)
-				{
-				case AttributeType::type_s32: printf("%d", it->second.data.s32); break;
-				case AttributeType::type_string: printf("%.*s", it->second.data.s.len, it->second.data.s.data); break;
-				}
+				printf("\n\t%s : ", it->first.c_str());
+
+				visit(AttrPrinter(), it->second);
 			};
 			printf("\n");
 		}
