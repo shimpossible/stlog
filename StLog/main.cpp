@@ -12,61 +12,6 @@
 #include <iostream>
 #include <string>
 
-struct AttrPrinter
-{
-	void operator()(bool b) 
-	{
-		printf("%d", b);
-	}
-
-	void operator()(float b)
-	{
-		printf("%f", b);
-	}
-	void operator()(double b)
-	{
-		printf("%lf", b);
-	}
-	void operator()(int8_t b)
-	{
-		printf("%d", b);
-	}
-	void operator()(int16_t b)
-	{
-		printf("%d", b);
-	}
-	void operator()(int32_t b)
-	{
-		printf("%d", b);
-	}
-	void operator()(int64_t b) 
-	{
-		printf("%lld", b);
-	}
-
-	void operator()(uint8_t b) 
-	{
-		printf("%u", b);
-	}
-	void operator()(uint16_t b) 
-	{
-		printf("%u", b);
-	}
-	void operator()(uint32_t b) 
-	{
-		printf("%u", b);
-	}
-	void operator()(uint64_t b) 
-	{
-		printf("%llu", b);
-	}
-
-	void operator()(const Span<const char>& b)
-	{
-		printf("%.*s", (int)b.len, b.data);
-	}
-};
-
 // single buffer shared by ALL loggers
 RingBuffer* buff_ptr;
 
@@ -76,6 +21,7 @@ void ReadThread(void* )
 	SimpleLogExporter e(be, *buff_ptr);
 	std::cout << "START\n";
 	printf("READ THREAD STARTED\n");
+	while (true) Sleep(1000);
 	while (true)
 	{
 		SimpleLogRecord slr;
@@ -116,13 +62,13 @@ thread_local LogScope* Logger::m_scope = 0;
 AllocBackEnd be;
 std::atomic<int> i = 0;
 std::atomic<float> k2 = 0;
+SimpleLogExporter* ex;
+SimpleLogProcessor* pro;
 void PushThread(void *arg)
 {
 	int loops = (int)arg;
-	SimpleLogExporter exp(be, *buff_ptr);
-	SimpleLogProcessor pro(std::move(exp));
-	Logger logger("test", pro);
-	Logger log2("log2", pro);
+	Logger logger("test", *pro);
+	Logger log2("log2", *pro);
 
 
 	for(int k=0;k<loops;k++)
@@ -133,13 +79,16 @@ void PushThread(void *arg)
 			{"file.line", (int)__LINE__},
 			{"thread.id", val },
 			});
+
+		int _i = i;
 		logger.log(Severity::Info, "Hello World",
 			{
-				{"key1", (int)(i++)},
+				{"key1", (int)i},
 				{"key2", k2.load()},
 				{"key3", "asdf" + std::to_string(k2) + " " + std::to_string(i)},
 			}
 		);
+		i+=1;
 
 		k2.store(k2 + 0.001);
 		{
@@ -156,7 +105,8 @@ void PushThread(void *arg)
 void *p1, *p2, *p3;
 int main()
 {
-	size_t st = sizeof(NamedAttribute);
+	AttributeValue v(0);
+
 	/*
 	_CrtSetDbgFlag(_CRTDBG_REPORT_FLAG
 	| _CRTDBG_LEAK_CHECK_DF
@@ -195,6 +145,10 @@ int main()
 	_CrtMemDumpAllObjectsSince(&state);
 	*/
 
+	ex = new SimpleLogExporter(be, *buff_ptr);
+	pro = new SimpleLogProcessor(*ex, be);
+
+	PushThread((void*)1000);
 	_beginthread(PushThread, 0, (void*)99999999);
 	_beginthread(PushThread, 0, (void*)99999999);
 	_beginthread(PushThread, 0, (void*)99999999);

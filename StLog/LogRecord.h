@@ -264,6 +264,8 @@ public:
 class LogRecord
 {
 public:
+	virtual ~LogRecord() {}
+
 	virtual void set_timestamp(uint64_t nsec) = 0;
 	virtual void set_severity(Severity severity) = 0;
 	void set_name(const char* name)
@@ -275,8 +277,11 @@ public:
 		set_message({ name, strlen(name) });
 	}
 
+	virtual void set_name(const Span<const char>& name) = 0;
+	virtual void set_message(const Span<const char>& message) = 0;
 	virtual void set_name(Span<const char>&& name) = 0;
 	virtual void set_message(Span<const char>&& message) = 0;
+
 	virtual void add_attribute(const Span<const char>& key, const AttributeValue& attr) = 0;
 };
 
@@ -290,7 +295,13 @@ public:
 	//! Creates new LogRecord to be filled by Logger
 	virtual LogRecord* create_record() = 0;
 
+	/**
+	 Used for scopes.  Creates storage for attributes in
+	 a scope
+	 */
 	virtual AttributeList* create_attribute_list() = 0;
+	virtual void release_attribute_list(AttributeList* attrs) = 0;
+
 	/**
 	Adds a record to be processed.  Processor will
 	release resources for the record
@@ -303,12 +314,15 @@ class LogExporter
 {
 public:
 	//! Creates a new LogRecord that can be exported
+	//! Should create a new record each time, or NULL if no null ones
+	//! can be created
 	virtual LogRecord* create_record() = 0;
-
-	virtual AttributeList* create_attribute_list() = 0;
 
 	//! Export a record and release resources 
 	virtual void export_record(LogRecord* rec) = 0;
+
+	//! Export range of records and releases resources
+	virtual void export_record(LogRecord* begin, size_t len) = 0;
 };
 
 
@@ -330,15 +344,8 @@ class LogScope
 	}
 public:
 	// called when LogScope is returned from Logger
-	LogScope(LogScope&& other);
-
-	~LogScope()
-	{
-		delete attrs;
-		// implicit end of scope
-		end();
-	}
-
+	LogScope(LogScope&& other) noexcept;
+	~LogScope();
 	// explicit end of scope
 	void end();
 };
@@ -419,12 +426,13 @@ private:
 inline void LogScope::end()
 {
 	if (logger == 0) return;
-	logger->m_scope = next;
 
+    logger->m_processor.release_attribute_list(attrs);
+	logger->m_scope = next;
 	logger = 0;
 }
 
-LogScope::LogScope(LogScope&& other)
+LogScope::LogScope(LogScope&& other) noexcept
 {
 	logger = std::move(other.logger);
 	attrs  = std::move(other.attrs);
@@ -437,43 +445,16 @@ LogScope::LogScope(LogScope&& other)
 	other.next = nullptr;
 	other.attrs = nullptr;
 }
-
-class SimpleLogProcessor : public LogProcessor
+LogScope::~LogScope()
 {
-public:
-	SimpleLogProcessor(LogExporter&& e)
-	: m_exporter( e )
-	{
-
-	}
-
-	virtual AttributeList* create_attribute_list()
-	{
-		return m_exporter.create_attribute_list();
-	}
-	//! Creates new LogRecord to be filled by Logger
-	virtual LogRecord* create_record()
-	{
-		return m_exporter.create_record();
-	}
-	/**
-	Adds a record to be processed.  Processor will
-	release resources for the record
-	*/
-	virtual void add_record(LogRecord* rec)
-	{
-		// no buffering, pass directly on
-		m_exporter.export_record(rec);
-	}
-private:
-
-	LogExporter& m_exporter;
-};
+	// implicit end of scope
+	end();
+}
 
 struct AllocBackEnd
 {
-	static const int COUNT = 100;
-	static const int BUFFERS = 2;
+	static const int COUNT = 2048;
+	static const int BUFFERS = 4;
 	char* buff[4];
 
 	// to help in lock-free need to know when index
@@ -485,13 +466,22 @@ struct AllocBackEnd
 	{
 		uint16_t index;
 		uint16_t seq;
+
+		bool operator==(const SeqCounter& rhs) const
+		{
+			return (index == rhs.index)
+				&& (seq == rhs.seq)
+				;
+		}
 	};
 	std::atomic<SeqCounter> free_list[4];
 	size_t size[4];
 
+	int MAX[4];
+
 	std::atomic<int> logi;
 	std::atomic<int> FLUSH;
-	struct L{
+	struct L {
 		uint64_t start;
 		uint64_t ts;
 		DWORD    tid;
@@ -523,15 +513,17 @@ struct AllocBackEnd
 		FLUSH = 0;
 		logi = 0;
 
-		size[0] = 64;
-		size[1] = 128;
-		size[2] = 256;
-		size[3] = 1024;
+		memset(MAX, 0, sizeof(MAX));
+
+		size[0] = 16;
+		size[1] = 64;
+		size[2] = 128;
+		size[3] = 256;
 
 
 		for (int i = 0; i < BUFFERS; i++)
 		{
-			free_list[i] = {0,0};
+			free_list[i] = { 0,0 };
 		}
 
 		for (int k = 0; k < BUFFERS; k++)
@@ -545,13 +537,13 @@ struct AllocBackEnd
 			}
 
 			// last pointer is invalid
-			p[(COUNT-1) * size[k] / sizeof(int)] = -1;
+			p[(COUNT - 1) * size[k] / sizeof(int)] = -1;
 		}
 	}
 	void DO_FLUSH()
 	{
 		int exp = 0;
-		while(!FLUSH.compare_exchange_strong(exp,1))
+		while (!FLUSH.compare_exchange_strong(exp, 1))
 		{
 			Sleep(1000);
 		}
@@ -564,7 +556,7 @@ struct AllocBackEnd
 		for (int i = 0; i < 2048; i++)
 		{
 			volatile L& l = log[i];
-			fprintf(f, "%llu %llu %d %d %d %d %d\n", 
+			fprintf(f, "%llu %llu %d %zd %d %d %d\n",
 				l.start,
 				l.ts,
 				l.tid,
@@ -572,13 +564,13 @@ struct AllocBackEnd
 				l.curr,
 				l.next,
 				l.alloc
-				);
+			);
 		}
 		fclose(f);
 	}
 	void* alloc(size_t n)
 	{
-		while (FLUSH) Sleep(1000);
+		//while (FLUSH) Sleep(1000);
 
 		void* rst = 0;
 
@@ -587,7 +579,7 @@ struct AllocBackEnd
 		{
 			if (n > size[i]) continue;
 
-			int* next = 0;
+			uint32_t* next = 0;
 
 			SeqCounter nxt;
 			do
@@ -597,10 +589,18 @@ struct AllocBackEnd
 				// latest free list pointer
 				SeqCounter curr = free_list[i];
 
-				if (curr.index == 0xFFFF)
+				if (curr.index > COUNT)
 					break;  // empty free list
 
-				next  = (int*)&(buff[i][size[i] * (curr.index)]);
+				next = (uint32_t*)&(buff[i][size[i] * (curr.index)]);
+
+				assert((char*)next >= buff[i]);
+				int last = *next;
+				if ((*next >= COUNT) && (free_list[i].load() ==  curr))
+				{
+					while (true);
+					break;  // empty free list
+				}
 
 				// another thread pulls item out of free list
 				// and inserts it again here..  *next would
@@ -609,11 +609,26 @@ struct AllocBackEnd
 				nxt.index = *next;
 				nxt.seq = curr.seq + 1;
 
+				if (nxt.index >= COUNT)
+				{
+					while (free_list[i].load().index == curr.index);
+				}
+
 				// if free_list changed, loop again
 				if (!free_list[i].compare_exchange_weak(curr, nxt)) continue;
 
+				if (nxt.index >= COUNT)
+					while (true);
+
+				if (MAX[i] < nxt.index)
+				{
+					MAX[i] = nxt.index;
+					if (i == 1)
+						printf("MX %d\n", MAX[i]);
+				}
+
 				break;
-			}while(true);
+			} while (true);
 
 			rst = next;
 			break;
@@ -636,7 +651,7 @@ struct AllocBackEnd
 			{
 				SeqCounter idx;
 				idx.index = (ptr - begin) / size[i];  // block number;
-				
+
 				SeqCounter next;
 				do
 				{
@@ -651,15 +666,18 @@ struct AllocBackEnd
 					// should be accessing it right now
 					*(int*)ptr = next.index;
 
+					if (next.index >= COUNT)
+						break;  // empty free list
+
 					idx.seq = next.seq + 1;
 				} while (!free_list[i].compare_exchange_weak(next, idx));
-				//printf("Free %d=>%d\n", next, idx);
-			
+
 				break;
 			}
 		}
 	}
 };
+
 
 /**
   Uses preallocated buffers
@@ -696,8 +714,296 @@ struct Alloc
 
 	void deallocate(value_type* p, std::size_t n) noexcept
 	{
-		be.dealloc((char*)p);
+		be.dealloc((char*)p);	
 	}
+};
+
+/**
+  Does not allocate memory.  Uses AllocBackEnd to get
+  memory it needs.   Allows for quick building of record and in places
+  that may not allow memory to be allocated
+ */
+class NoMallocLogRecord : public LogRecord
+{
+	AllocBackEnd& m_be;
+public:
+	NoMallocLogRecord(AllocBackEnd& be)
+	: m_be(be)
+	, m_attrs(Alloc< decltype(m_attrs)::value_type>(be))
+	{
+		m_attrs.reserve(8);
+		ts = 0;
+		severity = Severity::Trace;
+		name.len = 0;
+		message.len = 0;
+	}
+
+	~NoMallocLogRecord()
+	{
+		// free all the strings
+		for (auto it = m_attrs.begin();
+			it != m_attrs.end();
+			it++)
+		{
+			if (it->second.data_type == AttributeType::type_string_view)
+			{
+				m_be.dealloc((char*)it->second.data.s.data);
+			}
+		}
+	}
+	virtual void set_timestamp(uint64_t nsec)
+	{
+		ts = nsec;
+	}
+	virtual void set_severity(Severity severity)
+	{
+		this->severity = severity;
+	}
+
+	// bring in the overloaded names that take const char*
+	using LogRecord::set_message;
+	using LogRecord::set_name;
+
+	virtual void set_name(const Span<const char>& name)
+	{
+		this->name = name;
+	}
+	virtual void set_message(const Span<const char>& message)
+	{
+		this->message = message;
+	}
+	virtual void set_name(Span<const char>&& name)
+	{
+		this->name = std::move(name);
+	}
+
+	virtual void set_message(Span<const char>&& message)
+	{
+		this->message = std::move(message);
+	}
+
+	virtual void add_attribute(const Span<const char>& key, const AttributeValue& attr)
+	{
+		const auto& pair = this->m_attrs.emplace(key, attr);
+
+		// duplicate string, so it can go out of scope
+		if (attr.data_type == AttributeType::type_string_view)
+		{
+			AttributeValue& back = pair.first->second;
+			back.data.s.data = (char*)m_be.alloc(attr.data.s.len);
+			memcpy((char*)back.data.s.data, attr.data.s.data, attr.data.s.len);
+		}
+	}
+
+	uint64_t    ts;
+	Severity    severity;
+	Span<const char> name;
+	Span<const char> message;
+
+	typedef Span<const char> key_type;
+
+	std::unordered_map<key_type, AttributeValue,
+		std::hash<key_type>, std::equal_to<key_type>,
+		Alloc<std::pair<const key_type, AttributeValue>>> m_attrs;
+};
+
+class NoAllocAttributeList : public AttributeList
+{
+public:
+	std::vector<NamedAttribute, Alloc<NamedAttribute>> m_attrs;
+
+	NoAllocAttributeList(AllocBackEnd& be)
+		: m_attrs(Alloc<NamedAttribute>(be))
+	{
+		m_attrs.reserve(4);
+	}
+
+	~NoAllocAttributeList() {}
+
+	void add_attribute(const NamedAttribute& attr)
+	{
+		m_attrs.push_back(attr);
+	}
+
+	NamedAttribute* begin()
+	{
+		return &m_attrs[0];
+	}
+
+	NamedAttribute* end()
+	{
+		return begin() + m_attrs.size();
+	}
+};
+
+template<typename T>
+class CirculeBuffer
+{
+public:
+	CirculeBuffer(size_t len)
+	{
+		m_capacity = len;
+		m_data = new std::atomic<T*>[len];
+		m_read = 0;
+		m_write = 0;
+	}
+
+	void add(T* ptr)
+	{
+		while (true)
+		{
+			// grab local copy
+			uint64_t w = m_write;
+			if (size() >= m_capacity)
+			{
+				continue;
+				//while (true); // out of space?!
+			}
+
+			uint64_t index = w % m_capacity;
+
+			// expect to be empty, if not, another thread
+			// got here first, so loop again
+			T* exp = 0;
+			if (!m_data[index].compare_exchange_weak(exp, ptr)) continue;
+
+		    // update write pointer
+			// The exchange could fail, if a new item was added and 
+			// read between the first lines of this loop and here.
+			// The prior compare/exchange would pass becuase the read
+			// leaves m_data null,  this m_write however would reflect
+			// the added item(s).  So loop on fail
+			if (!m_write.compare_exchange_weak(w, w + 1)) continue;
+
+			// the index did not change so everything was successful
+			break;
+		}
+	}
+
+	T* consume()
+	{
+		if (m_write == m_read)
+		{
+			return nullptr;
+		}
+
+		uint64_t index = m_read % m_capacity;
+		T* exp = m_data[index];
+		while (!m_data[index].compare_exchange_weak(exp, nullptr) )
+		{
+			index = m_read % m_capacity;
+			exp = m_data[index];
+		}
+
+		// increment
+		m_read++;
+
+		return exp;
+	}
+
+	size_t size()
+	{
+		return m_write - m_read;
+	}
+private:
+	std::atomic<uint64_t> m_read;
+	std::atomic<uint64_t> m_write;
+	size_t m_capacity;
+	std::atomic<T*>* m_data;
+};
+
+class SimpleLogProcessor : public LogProcessor
+{
+	AllocBackEnd& m_be;
+	Alloc<NoMallocLogRecord> m_alloc;
+	typedef Alloc<NoMallocLogRecord>::rebind<NoAllocAttributeList>::other AllocAttrList;
+
+	CirculeBuffer<NoMallocLogRecord> m_buffer;
+
+	std::thread m_work_thread;
+public:
+	SimpleLogProcessor(LogExporter& e, AllocBackEnd& be)
+	: m_be(be)
+	, m_alloc(be)
+    , m_buffer(128)
+    , m_work_thread(&SimpleLogProcessor::DoWork, this)
+	, m_exporter( e )
+	{
+
+	}
+
+	void DoWork()
+	{
+		while (true)
+		{
+			NoMallocLogRecord* rec = m_buffer.consume();
+			if (rec == nullptr)
+			{
+				// TODO: sleep until there is data
+				continue;
+			}
+
+			LogRecord* r = m_exporter.create_record();
+			
+			r->set_message(rec->message.data);
+			r->set_name(rec->name.data);
+			r->set_severity(rec->severity);
+			r->set_timestamp(rec->ts);
+
+			for (auto it = rec->m_attrs.begin();
+				it != rec->m_attrs.end();
+				it++)
+			{
+				r->add_attribute(it->first, it->second);
+			}
+
+
+			// no buffering, pass directly on
+			m_exporter.export_record(r);
+			rec->~NoMallocLogRecord();
+			m_alloc.deallocate((NoMallocLogRecord*)rec, 1);
+		}
+	}
+
+	virtual AttributeList* create_attribute_list()
+	{
+
+		AllocAttrList a = m_alloc;
+		void* p = a.allocate(1);
+		return new (p) NoAllocAttributeList(m_be);
+	}
+
+	virtual void release_attribute_list(AttributeList* attrs)
+	{
+		AllocAttrList a = m_alloc;
+		attrs->~AttributeList();
+		a.deallocate((NoAllocAttributeList*)attrs, 1);
+	}
+
+	//! Creates new LogRecord to be filled by Logger
+	virtual LogRecord* create_record()
+	{
+		void* ptr = m_alloc.allocate(1);
+		NoMallocLogRecord* slr = new (ptr) NoMallocLogRecord(m_be);
+		return slr;
+	}
+
+	/**
+	Adds a record to be processed.  Processor will
+	release resources for the record
+	*/
+	virtual void add_record(LogRecord* rec)
+	{
+		// TODO: push record into a FIFO
+        //m_exporter.export_record(rec);
+
+		// add to circular buffer
+		m_buffer.add((NoMallocLogRecord*)rec);
+	}
+
+private:
+
+	LogExporter& m_exporter;
 };
 
 /**
@@ -717,6 +1023,24 @@ public:
 		message.len = 0;
 	}
 
+	~SimpleLogRecord()
+	{
+	}
+
+	void reset()
+	{
+		for (auto it = m_attrs.begin();
+			it != m_attrs.end();
+			it++)
+		{
+			if (it->second.data_type == AttributeType::type_string_view)
+			{
+				free((void*)it->second.data.s.data); // release the malloc buffer
+			}
+		}
+
+		m_attrs.clear();
+	}
 	virtual void set_timestamp(uint64_t nsec)
 	{
 		ts = nsec;
@@ -730,19 +1054,35 @@ public:
 	using LogRecord::set_message;
 	using LogRecord::set_name;
 
-	virtual void set_name(Span<const char>&& name)
+	virtual void set_name(const Span<const char>& name)
 	{
 		this->name = name;
 	}
-	virtual void set_message(Span<const char>&& message)
+	virtual void set_message(const Span<const char>& message)
 	{
 		this->message = message;
 	}
 
-	std::list<std::string> m_strings;
+
+	virtual void set_name(Span<const char>&& name)
+	{
+		this->name = std::move(name);
+	}
+	virtual void set_message(Span<const char>&& message)
+	{
+		this->message = std::move(message);
+	}
+
 	virtual void add_attribute(const Span<const char>& key, const AttributeValue& attr)
 	{
-		this->m_attrs.emplace(key, attr);
+		const auto& back = this->m_attrs.emplace(key, attr);
+		if (attr.data_type == AttributeType::type_string_view)
+		{
+			auto& av = back.first->second;
+			av.data.s.data = (char*)malloc(av.data.s.len);
+			assert(av.data.s.data != 0);
+			memcpy((char*)av.data.s.data, attr.data.s.data, av.data.s.len);
+		}
 	}
 
 	uint64_t    ts;
@@ -753,87 +1093,6 @@ public:
 	typedef std::string key_type;
 
 	std::unordered_map<key_type, AttributeValue> m_attrs;
-};
-
-class NoAllocAttributeList : public AttributeList
-{
-public:
-	std::vector<NamedAttribute, Alloc<NamedAttribute>> m_attrs;
-
-	NoAllocAttributeList(AllocBackEnd& be)
-	: m_attrs(Alloc<NamedAttribute>(be))
-	{
-	}
-
-	void add_attribute(const NamedAttribute& attr)
-	{
-		m_attrs.push_back(attr);
-	}
-
-	NamedAttribute* begin()
-	{
-		return &m_attrs[0];
-	}
-
-	NamedAttribute* end()
-	{
-		return begin() + m_attrs.size();
-	}
-};
-
-/**
-  Does not allocate memory.  Uses AllocBackEnd to get
-  memory it needs.   Allows for quick building of record and in places
-  that may not allow memory to be allocated
- */
-class NoMallocLogRecord : public LogRecord
-{
-public:
-	NoMallocLogRecord(AllocBackEnd& be)
-		: m_attrs(Alloc< decltype(m_attrs)::value_type>(be))
-	{
-		ts = 0;
-		severity = Severity::Trace;
-		name.len = 0;
-		message.len = 0;
-	}
-
-	virtual void set_timestamp(uint64_t nsec)
-	{
-		ts = nsec;
-	}
-	virtual void set_severity(Severity severity)
-	{
-		this->severity = severity;
-	}
-
-	// bring in the overloaded names
-	using LogRecord::set_message;
-	using LogRecord::set_name;
-
-	virtual void set_name(Span<const char>&& name)
-	{
-		this->name = name;
-	}
-	virtual void set_message(Span<const char>&& message)
-	{
-		this->message = message;
-	}
-	virtual void add_attribute(const Span<const char>& key, const AttributeValue& attr)
-	{
-		this->m_attrs.emplace(key, attr);
-	}
-
-	uint64_t    ts;
-	Severity    severity;
-	Span<const char> name;
-	Span<const char> message;
-
-	typedef Span<const char> key_type;
-
-	std::unordered_map<key_type, AttributeValue,
-		std::hash<key_type>, std::equal_to<key_type>,
-		Alloc<std::pair<const key_type, AttributeValue>>> m_attrs;
 };
 
 class RingBuffer
@@ -1042,6 +1301,61 @@ private:
 };
 
 
+struct AttrPrinter
+{
+	void operator()(bool b)
+	{
+		printf("%d", b);
+	}
+
+	void operator()(float b)
+	{
+		printf("%f", b);
+	}
+	void operator()(double b)
+	{
+		printf("%lf", b);
+	}
+	void operator()(int8_t b)
+	{
+		printf("%d", b);
+	}
+	void operator()(int16_t b)
+	{
+		printf("%d", b);
+	}
+	void operator()(int32_t b)
+	{
+		printf("%d", b);
+	}
+	void operator()(int64_t b)
+	{
+		printf("%lld", b);
+	}
+
+	void operator()(uint8_t b)
+	{
+		printf("%u", b);
+	}
+	void operator()(uint16_t b)
+	{
+		printf("%u", b);
+	}
+	void operator()(uint32_t b)
+	{
+		printf("%u", b);
+	}
+	void operator()(uint64_t b)
+	{
+		printf("%llu", b);
+	}
+
+	void operator()(const Span<const char>& b)
+	{
+		printf("%.*s", (int)b.len, b.data);
+	}
+};
+
 class SimpleLogExporter : public LogExporter 
 {
 
@@ -1052,7 +1366,7 @@ public:
 
 	SimpleLogExporter(AllocBackEnd& be, RingBuffer& buffer)
     : m_be(be)
-	, m_record(be)
+	, m_record()
 	, m_buffer(buffer)
 	{
 	}
@@ -1060,22 +1374,45 @@ public:
 	virtual LogRecord* create_record()
 	{
 		// only one record at a time is suppported
+		m_record.reset(); // ensure prior data is cleared..
 		return &m_record;
 	}
 
+	/*
 	virtual AttributeList* create_attribute_list()
 	{
 		return new NoAllocAttributeList(m_be);
+	}
+	*/
+
+	virtual void export_record(LogRecord* begin, size_t len)
+	{
+		for (size_t i = 0; i < len; i++)
+		{
+			export_record(begin + i);
+		}
 	}
 
 	//! Export a record and release resources 
 	virtual void export_record(LogRecord* rec)
 	{
-		Alloc<char> al(m_be);
-		std::basic_string<char, std::char_traits<char>, Alloc<char>> foo("abcd", al);
+		SimpleLogRecord* s = (SimpleLogRecord*)rec;
 
-		NoMallocLogRecord* s = (NoMallocLogRecord*)rec;
-
+		printf("name: %.*s\n", s->name.len, s->name.data);
+		printf(" msg: %.*s\n", s->message.data, s->message.data);
+		printf("  ts: %llu\n", s->ts);
+		printf(" sev: %d\n", s->severity);
+		for (auto it = s->m_attrs.begin();
+			      it != s->m_attrs.end();
+			      it++)
+		{
+			printf("\t%s : ", it->first.c_str());
+			AttrPrinter ptr;
+			visit(ptr, it->second);
+			printf("\n");
+		}
+		return;
+#if 0
 		// see how much space we need
 		size_t req_bytes = measure(*s);
 
@@ -1112,9 +1449,8 @@ public:
 
 		s->set_message("");
 		s->set_name("");
-		s->set_timestamp(0);
-		// release resources
-		s->m_attrs.clear();
+		s->set_timestamp(0);	
+#endif
 	}
 
 	bool read_record(LogRecord& rec, char* buff, size_t len)
@@ -1339,6 +1675,6 @@ private:
 		return result;
 	}
 
-	NoMallocLogRecord  m_record;
+	SimpleLogRecord  m_record;
 	RingBuffer&      m_buffer;
 };
