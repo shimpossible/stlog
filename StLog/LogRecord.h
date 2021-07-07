@@ -58,6 +58,7 @@ struct Span
 
 namespace std
 {
+	// used for maps for attributes
 	template<>
 	struct hash<Span<const char>>
 	{
@@ -350,11 +351,13 @@ public:
 	void end();
 };
 
+class LogProvider;
+
 class Logger
 {
 public:
-	Logger(const char* name, LogProcessor& proc)
-	: m_processor(proc)
+	Logger(const char* name, LogProvider& pro)
+    : m_provider(pro)
 	{
 		m_name = name;
 	}
@@ -362,94 +365,60 @@ public:
 	/**
 	 Begin a Scope block to attach extra attributes
 	 */
-	LogScope begin_scope(std::initializer_list<NamedAttribute> at)
-	{
-		AttributeList* attrs = m_processor.create_attribute_list();
+	LogScope begin_scope(std::initializer_list<NamedAttribute> at);
 
-		for (const NamedAttribute* it = at.begin();
-			it < at.end();
-			it++)
-		{
-			attrs->add_attribute(*it);
-		}
-		LogScope scope(attrs);
-		scope.logger = this;
-		scope.next = m_scope;
-		m_scope = &scope;
-		return scope;
-	}
-
-	void log(Severity sev, const char* msg, std::initializer_list<NamedAttribute> attrs)
-	{
-		LogRecord* r = m_processor.create_record();
-		uint64_t nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(
-			std::chrono::system_clock::now().time_since_epoch()
-			).count();
-
-		r->set_timestamp(nsec);
-		r->set_name(m_name);
-		r->set_message(msg);
-		r->set_severity(sev);
-
-		const NamedAttribute* it;
-
-		// Add scope values
-		LogScope* curr = m_scope;
-		int depth = 0;
-		while (curr)
-		{
-			for (it = curr->attrs->begin(); it < curr->attrs->end(); it++)
-			{
-				r->add_attribute(it->name, it->value);
-			}
-			curr = curr->next;
-		}
-
-		// add local values
-		for (it = attrs.begin(); it < attrs.end(); it++)
-		{
-			r->add_attribute(it->name, it->value);
-		}
-
-		m_processor.add_record(r);
-	}
+	void log(Severity sev, const char* msg, std::initializer_list<NamedAttribute> attrs);
 
 private:
 	friend LogScope;
 
-	LogProcessor& m_processor;
+	LogProvider&  m_provider;
 	const char*   m_name;
 
 	static thread_local LogScope* m_scope;
 };
 
-inline void LogScope::end()
+class LogProvider
 {
-	if (logger == 0) return;
+public:
+	Logger& get(const char* name)
+	{
+		// holds lock while in the function
+		std::lock_guard<std::mutex> guard(m_lock);
 
-    logger->m_processor.release_attribute_list(attrs);
-	logger->m_scope = next;
-	logger = 0;
-}
+		auto it = m_loggers.find(name);
 
-LogScope::LogScope(LogScope&& other) noexcept
-{
-	logger = std::move(other.logger);
-	attrs  = std::move(other.attrs);
-	next   = std::move(other.next);
+		// was in the map
+		if (it != m_loggers.end()) return *it->second;
 
-	assert(logger->m_scope == &other);
-	logger->m_scope = this;
+		Logger* logger = new Logger(name, *this);
+		m_loggers[name] = logger;
 
-	other.logger = nullptr;
-	other.next = nullptr;
-	other.attrs = nullptr;
-}
-LogScope::~LogScope()
-{
-	// implicit end of scope
-	end();
-}
+		return *logger;
+	}
+
+	LogProcessor* get_processor() { return m_proc; }
+	LogExporter* get_exporter() { return m_exp;  }
+
+	LogProvider& with_processor(LogProcessor* proc)
+	{
+		m_proc = proc;
+
+		return *this;
+	}
+	LogProvider& with_exporter(LogExporter* exp)
+	{
+		m_exp = exp;
+		return *this;
+	}
+protected:
+
+	LogProcessor* m_proc;
+	LogExporter* m_exp;
+
+	std::unordered_map<const char*, Logger*> m_loggers;
+	std::mutex  m_lock;  //!< protects m_loggers
+};
 
 struct AllocBackEnd
 {
@@ -479,40 +448,8 @@ struct AllocBackEnd
 
 	int MAX[4];
 
-	std::atomic<int> logi;
-	std::atomic<int> FLUSH;
-	struct L {
-		uint64_t start;
-		uint64_t ts;
-		DWORD    tid;
-		size_t   size;
-		uint8_t  curr;
-		uint8_t  next;
-		uint8_t  alloc;
-	};
-	volatile L log[2048];
-
-	void push(int curr, int next, uint8_t alloc, int size, uint64_t start)
-	{
-		int ind;
-		do
-		{
-			ind = logi;
-		} while (!logi.compare_exchange_strong(ind, (ind + 1) & 2047));
-		log[ind].start = start;
-		log[ind].ts = std::chrono::system_clock::now().time_since_epoch().count();
-		log[ind].tid = GetCurrentThreadId();
-		log[ind].size = size;
-		log[ind].curr = curr;
-		log[ind].next = next;
-		log[ind].alloc = alloc;
-	}
-
 	AllocBackEnd()
 	{
-		FLUSH = 0;
-		logi = 0;
-
 		memset(MAX, 0, sizeof(MAX));
 
 		size[0] = 16;
@@ -540,38 +477,9 @@ struct AllocBackEnd
 			p[(COUNT - 1) * size[k] / sizeof(int)] = -1;
 		}
 	}
-	void DO_FLUSH()
-	{
-		int exp = 0;
-		while (!FLUSH.compare_exchange_strong(exp, 1))
-		{
-			Sleep(1000);
-		}
 
-		FLUSH = 1;
-
-		FILE* f;
-		fopen_s(&f, "trace.log", "w");
-
-		for (int i = 0; i < 2048; i++)
-		{
-			volatile L& l = log[i];
-			fprintf(f, "%llu %llu %d %zd %d %d %d\n",
-				l.start,
-				l.ts,
-				l.tid,
-				l.size,
-				l.curr,
-				l.next,
-				l.alloc
-			);
-		}
-		fclose(f);
-	}
 	void* alloc(size_t n)
 	{
-		//while (FLUSH) Sleep(1000);
-
 		void* rst = 0;
 
 		// find the smallest size that meets the requested size
@@ -640,7 +548,6 @@ struct AllocBackEnd
 
 	void dealloc(char* ptr)
 	{
-		while (FLUSH) Sleep(1000);
 		for (int i = 0; i < BUFFERS; i++)
 		{
 			char* begin = buff[i];
@@ -784,7 +691,7 @@ public:
 
 	virtual void add_attribute(const Span<const char>& key, const AttributeValue& attr)
 	{
-		const auto& pair = this->m_attrs.emplace(key, attr);
+		const auto& pair = this->m_attrs.emplace(key.data, attr);
 
 		// duplicate string, so it can go out of scope
 		if (attr.data_type == AttributeType::type_string_view)
@@ -800,7 +707,7 @@ public:
 	Span<const char> name;
 	Span<const char> message;
 
-	typedef Span<const char> key_type;
+	typedef const char* key_type;
 
 	std::unordered_map<key_type, AttributeValue,
 		std::hash<key_type>, std::equal_to<key_type>,
@@ -854,7 +761,7 @@ public:
 		{
 			// grab local copy
 			uint64_t w = m_write;
-			if (size() >= m_capacity)
+			if (size() >= m_capacity-1)
 			{
 				continue;
 				//while (true); // out of space?!
@@ -873,7 +780,13 @@ public:
 			// The prior compare/exchange would pass becuase the read
 			// leaves m_data null,  this m_write however would reflect
 			// the added item(s).  So loop on fail
-			if (!m_write.compare_exchange_weak(w, w + 1)) continue;
+			if (!m_write.compare_exchange_weak(w, w + 1))
+			{
+				// change it back to null since it should be empty..
+				// and loop to try again
+				m_data[index] = nullptr;
+				continue;
+			}
 
 			// the index did not change so everything was successful
 			break;
@@ -922,12 +835,12 @@ class SimpleLogProcessor : public LogProcessor
 
 	std::thread m_work_thread;
 public:
-	SimpleLogProcessor(LogExporter& e, AllocBackEnd& be)
+	SimpleLogProcessor(LogProvider& p, AllocBackEnd& be)
 	: m_be(be)
 	, m_alloc(be)
     , m_buffer(128)
     , m_work_thread(&SimpleLogProcessor::DoWork, this)
-	, m_exporter( e )
+	, m_provider(p)
 	{
 
 	}
@@ -943,7 +856,7 @@ public:
 				continue;
 			}
 
-			LogRecord* r = m_exporter.create_record();
+			LogRecord* r = m_provider.get_exporter()->create_record();
 			
 			r->set_message(rec->message.data);
 			r->set_name(rec->name.data);
@@ -959,7 +872,7 @@ public:
 
 
 			// no buffering, pass directly on
-			m_exporter.export_record(r);
+			m_provider.get_exporter()->export_record(r);
 			rec->~NoMallocLogRecord();
 			m_alloc.deallocate((NoMallocLogRecord*)rec, 1);
 		}
@@ -994,22 +907,19 @@ public:
 	*/
 	virtual void add_record(LogRecord* rec)
 	{
-		// TODO: push record into a FIFO
-        //m_exporter.export_record(rec);
-
 		// add to circular buffer
 		m_buffer.add((NoMallocLogRecord*)rec);
 	}
 
 private:
 
-	LogExporter& m_exporter;
+	LogProvider& m_provider;
 };
 
 /**
- Implements a LogRecord using a unordered_map with std::string for keys.
- This allows easiy construction and reading, but allocates memory as
- its built
+ Implements a LogRecord using an unordered_map and duplicates
+ strings.  Allowing the source strings to be released. Recommend
+ to use this on the exporter backend only
  */
 class SimpleLogRecord : public LogRecord
 {
@@ -1025,22 +935,25 @@ public:
 
 	~SimpleLogRecord()
 	{
+		reset();
 	}
 
 	void reset()
 	{
+		reset(name);
+		reset(message);
 		for (auto it = m_attrs.begin();
 			it != m_attrs.end();
 			it++)
 		{
 			if (it->second.data_type == AttributeType::type_string_view)
 			{
-				free((void*)it->second.data.s.data); // release the malloc buffer
+				reset(it->second.data.s);
 			}
 		}
-
 		m_attrs.clear();
 	}
+
 	virtual void set_timestamp(uint64_t nsec)
 	{
 		ts = nsec;
@@ -1056,21 +969,20 @@ public:
 
 	virtual void set_name(const Span<const char>& name)
 	{
-		this->name = name;
+		clone(this->name, name);
 	}
 	virtual void set_message(const Span<const char>& message)
 	{
-		this->message = message;
+		clone(this->message, message);
 	}
-
 
 	virtual void set_name(Span<const char>&& name)
 	{
-		this->name = std::move(name);
+		clone(this->name, name);
 	}
 	virtual void set_message(Span<const char>&& message)
 	{
-		this->message = std::move(message);
+		clone(this->message, message);
 	}
 
 	virtual void add_attribute(const Span<const char>& key, const AttributeValue& attr)
@@ -1079,22 +991,47 @@ public:
 		if (attr.data_type == AttributeType::type_string_view)
 		{
 			auto& av = back.first->second;
-			av.data.s.data = (char*)malloc(av.data.s.len);
-			assert(av.data.s.data != 0);
-			memcpy((char*)av.data.s.data, attr.data.s.data, av.data.s.len);
+			av.data.s.len = 0;
+			av.data.s.data = 0;
+			clone(av.data.s, attr.data.s);		
 		}
 	}
 
-	uint64_t    ts;
-	Severity    severity;
+	uint64_t         ts;
+	Severity         severity;
 	Span<const char> name;
 	Span<const char> message;
 
 	typedef std::string key_type;
 
 	std::unordered_map<key_type, AttributeValue> m_attrs;
+protected:
+
+	void reset(Span<const char>& src)
+	{
+		free((char*)src.data);
+		src.data = 0;
+		src.len = 0;
+	}
+
+	void clone(Span<const char>& dst, const Span<const char>& other)
+	{
+		if (dst.len != other.len)
+		{
+			if (dst.data) free((char*)dst.data);
+			dst.data = (char*)malloc(other.len * sizeof(char));
+			dst.len = other.len;
+		}
+		assert(dst.data != 0);
+		memcpy((char*)dst.data, other.data, other.len);
+	}
 };
 
+/**
+ A Ring buffer supporting entries of arbatrary size.  Each is prefixed
+ with a 32bit length.  If no space available at the end, older entries are
+ dropped until there is enough space available
+ */
 class RingBuffer
 {
 public:
@@ -1300,7 +1237,9 @@ private:
 	size_t  m_len;
 };
 
-
+/**
+ print attribute value using printf
+ */
 struct AttrPrinter
 {
 	void operator()(bool b)
@@ -1356,34 +1295,24 @@ struct AttrPrinter
 	}
 };
 
-class SimpleLogExporter : public LogExporter 
+/**
+ 'Export' LogRecord using printf
+ */
+class PrintfLogExporter : public LogExporter 
 {
-
-	bool full_string = true;
-
-	AllocBackEnd& m_be;
 public:
-
-	SimpleLogExporter(AllocBackEnd& be, RingBuffer& buffer)
-    : m_be(be)
-	, m_record()
-	, m_buffer(buffer)
+	PrintfLogExporter(AllocBackEnd& be)
+	: m_record()
 	{
 	}
 	//! Creates a new LogRecord that can be exported
 	virtual LogRecord* create_record()
 	{
+		// TODO: allow multiple
 		// only one record at a time is suppported
 		m_record.reset(); // ensure prior data is cleared..
 		return &m_record;
 	}
-
-	/*
-	virtual AttributeList* create_attribute_list()
-	{
-		return new NoAllocAttributeList(m_be);
-	}
-	*/
 
 	virtual void export_record(LogRecord* begin, size_t len)
 	{
@@ -1398,8 +1327,8 @@ public:
 	{
 		SimpleLogRecord* s = (SimpleLogRecord*)rec;
 
-		printf("name: %.*s\n", s->name.len, s->name.data);
-		printf(" msg: %.*s\n", s->message.data, s->message.data);
+		printf("name: %.*s\n", (int)s->name.len, s->name.data);
+		printf(" msg: %.*s\n", (int)s->message.len, s->message.data);
 		printf("  ts: %llu\n", s->ts);
 		printf(" sev: %d\n", s->severity);
 		for (auto it = s->m_attrs.begin();
@@ -1412,269 +1341,9 @@ public:
 			printf("\n");
 		}
 		return;
-#if 0
-		// see how much space we need
-		size_t req_bytes = measure(*s);
-
-		// get a buffer big enough
-		char* buff = m_buffer.reserve(req_bytes);
-		char* begin = buff;
-
-		buff = put(buff, s->ts);
-		buff = put(buff, s->severity);
-		buff = put(buff, s->name);
-		buff = put(buff, s->message);
-
-		for (auto it = s->m_attrs.begin();
-			it != s->m_attrs.end();
-			it++)
-		{
-			const Span<const char> key = it->first;
-			AttributeValue& val = it->second;
-
-			if (!full_string)
-			{
-				// store as pointer to const string.  This should be a pointer into
-				// the string table so no need to copy the string.
-				buff = put(buff, key.data);
-			}
-			else
-			{
-				buff = put(buff, key);
-			}
-			buff = put(buff, val);
-		}
-
-		m_buffer.commit(begin);
-
-		s->set_message("");
-		s->set_name("");
-		s->set_timestamp(0);	
-#endif
-	}
-
-	bool read_record(LogRecord& rec, char* buff, size_t len)
-	{
-		size_t bytes = m_buffer.consume(buff, len);
-		if (bytes == 0) return false;
-
-		char* it = buff;
-		char* end = it + bytes;
-
-		uint64_t ts;
-		Severity sev;
-		Span<const char> name;
-		Span<const char> message;
-		it = get(it, ts);
-		it = get(it, sev);
-		it = get(it, name);
-		it = get(it, message);
-
-		rec.set_timestamp(ts);
-		rec.set_severity(sev);
-		rec.set_name( std::move(name) );
-		rec.set_message( std::move(message) );
-
-		// loop through attributes
-		while (it < end)
-		{
-			Span<const char> attr_name;
-			AttributeValue attr(0);
-
-			if (!full_string)
-			{
-				// Name is stored as pointer to the const string
-				const char* name_ptr = 0;
-				it = get(it, name_ptr);
-				attr_name = name_ptr; // convert to Span
-			}
-			else
-			{				
-				it = get(it, attr_name);
-			}
-			char* st = it;
-			it = get(it, attr);
-
-			rec.add_attribute(attr_name, attr);
-		}
-
-		return true;
 	}
 
 private:
 
-	char* put(char* buff, AttributeValue& val)
-	{
-		buff = put(buff, val.data_type);
-		switch (val.data_type)
-		{
-		case AttributeType::type_bool: buff = put(buff, val.data.b); break;
-		case AttributeType::type_u8:  buff = put(buff, val.data.u8); break;
-		case AttributeType::type_s8:  buff = put(buff, val.data.s8); break;
-		case AttributeType::type_u16: buff = put(buff, val.data.u16); break;
-		case AttributeType::type_s16: buff = put(buff, val.data.s16); break;
-		case AttributeType::type_f32: buff = put(buff, val.data.f32); break;
-		case AttributeType::type_u32: buff = put(buff, val.data.u32); break;
-		case AttributeType::type_s32: buff = put(buff, val.data.s32); break;
-		case AttributeType::type_f64: buff = put(buff, val.data.f64); break;
-		case AttributeType::type_u64: buff = put(buff, val.data.u64); break;
-		case AttributeType::type_s64: buff = put(buff, val.data.s64); break;
-		case AttributeType::type_string_view: 
-			buff = put(buff, val.data.s ); 
-			break;
-		}
-
-		return buff;
-	}
-
-	// put string pointer
-	char* put(char* buff, const char* st)
-	{
-		memcpy(buff, &st, sizeof(st));
-		return buff + sizeof(st);
-	}
-
-	char* put(char* buff, Span<char const>&& val)
-	{
-		return put(buff, val);
-	}
-	char* put(char* buff, const Span<char const>& val)
-	{
-		size_t l = val.len;
-		if (l > 255) l = 255;
-
-		// 8bit len
-		buff = put(buff, (uint8_t)l);
-
-		// text
-		memcpy(buff, val.data, l);
-		buff += l;
-		return buff;
-	}
-
-	template<typename T,
-		typename std::enable_if<
-		   std::is_fundamental< typename std::decay<T>::type >::value ||
-		   std::is_enum< typename std::decay<T>::type >::value
-		, int>::type = 0
-	>
-	char* put(char* buff, T&& val)
-	{
-		memcpy(buff, &val, sizeof(val));
-		buff += sizeof(val);
-		return buff;
-	}
-
-	char* get(char* buff, const char*& val)
-	{
-		memcpy(&val, buff, sizeof(val));
-		return buff + sizeof(val);
-	}
-
-	char* get(char* buff, Span<const char>& val)
-	{
-		val.len = *(uint8_t*)buff;
-		val.data = &buff[1];
-		buff += val.len + 1;
-		return buff;
-	}
-
-	char* get(char* buff, AttributeValue& val)
-	{
-		buff = get(buff, val.data_type);
-		switch (val.data_type)
-		{
-		case AttributeType::type_bool: buff = get(buff, val.data.b); break;
-		case AttributeType::type_u8:  buff = get(buff, val.data.u8); break;
-		case AttributeType::type_s8:  buff = get(buff, val.data.s8); break;
-		case AttributeType::type_u16: buff = get(buff, val.data.u16); break;
-		case AttributeType::type_s16: buff = get(buff, val.data.s16); break;
-		case AttributeType::type_f32: buff = get(buff, val.data.f32); break;
-		case AttributeType::type_u32: buff = get(buff, val.data.u32); break;
-		case AttributeType::type_s32: buff = get(buff, val.data.s32); break;
-		case AttributeType::type_f64: buff = get(buff, val.data.f64); break;
-		case AttributeType::type_u64: buff = get(buff, val.data.u64); break;
-		case AttributeType::type_s64: buff = get(buff, val.data.s64); break;
-		case AttributeType::type_string_view:
-			buff = get(buff, val.data.s);
-			break;
-		}
-
-		return buff;
-	}
-
-	
-	template<typename T>
-	typename std::enable_if<
-		std::is_fundamental< typename std::decay<T>::type >::value ||
-		std::is_enum< typename std::decay<T>::type >::value
-		,  
-		char*>::type get(char* buff, T&& val)
-	{
-		memcpy(&val, buff, sizeof(val));
-		buff += sizeof(val);
-		return buff;
-	}
-
-	size_t measure(NoMallocLogRecord& rec)
-	{
-		size_t result = 0;
-
-		result += sizeof(rec.ts);
-		result += sizeof(rec.severity);
-		result += rec.name.len + 1;   // short string
-		result += rec.message.len + 1;  // long string
-
-		for (auto it = rec.m_attrs.begin();
-			      it != rec.m_attrs.end();
-			      it++)
-		{
-			Span<const char> key = it->first;
-			AttributeValue& val  = it->second;
-
-			if (full_string)
-			{
-				// 255 length limit
-				result += key.len + 1;
-			}
-			else
-			{
-				result += sizeof(char*);
-			}
-
-
-			// each type has a 1 byte prefix followed by encoded value..
-			// strings also have a length prefix
-			result += 1;
-			switch (val.data_type)
-			{
-			case AttributeType::type_bool:
-			case AttributeType::type_u8:
-			case AttributeType::type_s8:
-			   result += 1;
-			   break;
-			case AttributeType::type_u16:
-			case AttributeType::type_s16:
-				result += 2;
-				break;
-			case AttributeType::type_f32:
-			case AttributeType::type_u32:
-			case AttributeType::type_s32:
-				result += 4;
-				break;
-			case AttributeType::type_f64:
-			case AttributeType::type_u64:
-			case AttributeType::type_s64:
-				result += 8;
-				break;
-			case AttributeType::type_string_view:
-				result += val.data.s.len + 1;
-			}
-		}
-
-		return result;
-	}
-
 	SimpleLogRecord  m_record;
-	RingBuffer&      m_buffer;
 };

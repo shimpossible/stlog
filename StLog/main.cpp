@@ -12,63 +12,18 @@
 #include <iostream>
 #include <string>
 
-// single buffer shared by ALL loggers
-RingBuffer* buff_ptr;
-
-void ReadThread(void* )
-{
-	AllocBackEnd be;
-	SimpleLogExporter e(be, *buff_ptr);
-	std::cout << "START\n";
-	printf("READ THREAD STARTED\n");
-	while (true) Sleep(1000);
-	while (true)
-	{
-		SimpleLogRecord slr;
-
-		char buff[4096];
-		bool b1 = e.read_record(slr, buff, sizeof(buff));
-		if (b1)
-		{
-			printf("%llu ", slr.ts);
-			printf("%04x ", slr.severity);
-			printf("%.*s - ", (int)slr.name.len, slr.name.data);
-			printf("%.*s - ", (int)slr.message.len, slr.message.data);
-			for (auto it = slr.m_attrs.begin();
-				      it != slr.m_attrs.end();
-				      it++)
-			{
-				printf("\n\t%s : ", it->first.c_str());
-
-				if (it->first == "file.name")
-				{
-					size_t n = strlen(__FILE__);
-					if (strncmp(it->second.data.s.data, __FILE__, n) != 0 ||
-						n != it->second.data.s.len)
-					{
-						printf("WRONG STRING\n");
-					}
-				}
-				AttrPrinter ptr;
-				visit(ptr, it->second);
-			};
-			printf("\n");
-		}
-	}
-}
-
 thread_local LogScope* Logger::m_scope = 0;
 
 AllocBackEnd be;
 std::atomic<int> i = 0;
 std::atomic<float> k2 = 0;
-SimpleLogExporter* ex;
-SimpleLogProcessor* pro;
+
+LogProvider* pro = 0;
 void PushThread(void *arg)
 {
 	int loops = (int)arg;
-	Logger logger("test", *pro);
-	Logger log2("log2", *pro);
+	Logger& logger = pro->get("test");
+	Logger& log2 = pro->get("log2");
 
 
 	for(int k=0;k<loops;k++)
@@ -98,7 +53,7 @@ void PushThread(void *arg)
 			log2.log(Severity::Info, "Nexted", {});
 		}
 		scope.end();
-		//Sleep(100);
+		Sleep(100);
 	}
 }
 
@@ -132,9 +87,6 @@ int main()
 	//std::pair<int, AttributeValue> pair(1, av);
 
 	printf("starting...");
-	_beginthread(ReadThread, 0x100000, 0);
-	RingBuffer buff(65536);
-	buff_ptr = &buff;
 
 	/*
 	* // Check for leaks
@@ -145,10 +97,15 @@ int main()
 	_CrtMemDumpAllObjectsSince(&state);
 	*/
 
-	ex = new SimpleLogExporter(be, *buff_ptr);
-	pro = new SimpleLogProcessor(*ex, be);
+	pro = new LogProvider();
+	PrintfLogExporter* ex = new PrintfLogExporter(be);
+	SimpleLogProcessor* p = new SimpleLogProcessor(*pro, be);
 
-	PushThread((void*)1000);
+	pro->with_exporter(ex)
+		.with_processor(p);
+
+
+	//PushThread((void*)1000);
 	_beginthread(PushThread, 0, (void*)99999999);
 	_beginthread(PushThread, 0, (void*)99999999);
 	_beginthread(PushThread, 0, (void*)99999999);
