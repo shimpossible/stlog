@@ -58,7 +58,7 @@ struct Span
 
 namespace std
 {
-	// used for maps for attributes
+	// hash for string Spans
 	template<>
 	struct hash<Span<const char>>
 	{
@@ -77,6 +77,7 @@ namespace std
 		}
 	};
 }
+
 enum class AttributeType : uint8_t
 {
 	type_u8,
@@ -249,7 +250,6 @@ struct NamedAttribute
 	AttributeValue value;
 };
 
-
 class AttributeList
 {
 public:
@@ -323,7 +323,7 @@ public:
 	virtual void export_record(LogRecord* rec) = 0;
 
 	//! Export range of records and releases resources
-	virtual void export_record(LogRecord* begin, size_t len) = 0;
+	virtual void export_record(LogRecord** begin, size_t len) = 0;
 };
 
 
@@ -827,13 +827,8 @@ private:
 
 class SimpleLogProcessor : public LogProcessor
 {
-	AllocBackEnd& m_be;
-	Alloc<NoMallocLogRecord> m_alloc;
-	typedef Alloc<NoMallocLogRecord>::rebind<NoAllocAttributeList>::other AllocAttrList;
-
-	CirculeBuffer<NoMallocLogRecord> m_buffer;
-
-	std::thread m_work_thread;
+	typedef NoMallocLogRecord RecordType;
+	typedef Alloc<RecordType>::rebind<NoAllocAttributeList>::other AllocAttrList;
 public:
 	SimpleLogProcessor(LogProvider& p, AllocBackEnd& be)
 	: m_be(be)
@@ -849,32 +844,43 @@ public:
 	{
 		while (true)
 		{
-			NoMallocLogRecord* rec = m_buffer.consume();
-			if (rec == nullptr)
+			size_t count = m_buffer.size();
+
+			// TODO: limit count to a max value?
+
+			std::vector<LogRecord*> vec;
+			vec.reserve(count); // resever the number of entries needed
+
+			// get reference here to ensure it doesn't change during loop
+			LogExporter* exp = m_provider.get_exporter();
+			for (size_t i = 0; i<count; i++)
 			{
-				// TODO: sleep until there is data
-				continue;
+				// translate from the RecordType type
+				// to whatever the exporter uses
+				RecordType* rec = m_buffer.consume();
+				LogRecord* r = exp->create_record();
+				if (r == nullptr) break;  // exporter is out of records?
+
+				r->set_message(rec->message.data);
+				r->set_name(rec->name.data);
+				r->set_severity(rec->severity);
+				r->set_timestamp(rec->ts);
+
+				for (auto it = rec->m_attrs.begin();
+					it != rec->m_attrs.end();
+					it++)
+				{
+					r->add_attribute(it->first, it->second);
+				}
+
+				rec->~RecordType();
+				m_alloc.deallocate((RecordType*)rec, 1);
+
+				vec.push_back(r);
 			}
-
-			LogRecord* r = m_provider.get_exporter()->create_record();
-			
-			r->set_message(rec->message.data);
-			r->set_name(rec->name.data);
-			r->set_severity(rec->severity);
-			r->set_timestamp(rec->ts);
-
-			for (auto it = rec->m_attrs.begin();
-				it != rec->m_attrs.end();
-				it++)
-			{
-				r->add_attribute(it->first, it->second);
-			}
-
 
 			// no buffering, pass directly on
-			m_provider.get_exporter()->export_record(r);
-			rec->~NoMallocLogRecord();
-			m_alloc.deallocate((NoMallocLogRecord*)rec, 1);
+			exp->export_record(vec.data(), vec.size());
 		}
 	}
 
@@ -897,7 +903,7 @@ public:
 	virtual LogRecord* create_record()
 	{
 		void* ptr = m_alloc.allocate(1);
-		NoMallocLogRecord* slr = new (ptr) NoMallocLogRecord(m_be);
+		RecordType* slr = new (ptr) RecordType(m_be);
 		return slr;
 	}
 
@@ -908,12 +914,17 @@ public:
 	virtual void add_record(LogRecord* rec)
 	{
 		// add to circular buffer
-		m_buffer.add((NoMallocLogRecord*)rec);
+		m_buffer.add((RecordType*)rec);
 	}
 
 private:
 
-	LogProvider& m_provider;
+	AllocBackEnd&     m_be;
+	Alloc<RecordType> m_alloc;
+	CirculeBuffer<RecordType> m_buffer;
+	std::thread       m_work_thread;
+	LogProvider&      m_provider;
+
 };
 
 /**
@@ -1302,23 +1313,20 @@ class PrintfLogExporter : public LogExporter
 {
 public:
 	PrintfLogExporter(AllocBackEnd& be)
-	: m_record()
 	{
 	}
 	//! Creates a new LogRecord that can be exported
 	virtual LogRecord* create_record()
 	{
-		// TODO: allow multiple
-		// only one record at a time is suppported
-		m_record.reset(); // ensure prior data is cleared..
-		return &m_record;
+		// TODO: use a pool of records..
+		return new SimpleLogRecord();
 	}
 
-	virtual void export_record(LogRecord* begin, size_t len)
+	virtual void export_record(LogRecord** begin, size_t len)
 	{
 		for (size_t i = 0; i < len; i++)
 		{
-			export_record(begin + i);
+			export_record(begin[i]);
 		}
 	}
 
@@ -1340,7 +1348,9 @@ public:
 			visit(ptr, it->second);
 			printf("\n");
 		}
-		return;
+		
+		// release
+		delete rec;
 	}
 
 private:
