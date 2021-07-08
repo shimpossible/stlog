@@ -557,7 +557,7 @@ struct AllocBackEnd
 			if (ptr >= begin && ptr < end)
 			{
 				SeqCounter idx;
-				idx.index = (ptr - begin) / size[i];  // block number;
+				idx.index = (uint16_t)((ptr - begin) / size[i]);  // block number;
 
 				SeqCounter next;
 				do
@@ -829,30 +829,45 @@ class SimpleLogProcessor : public LogProcessor
 {
 	typedef NoMallocLogRecord RecordType;
 	typedef Alloc<RecordType>::rebind<NoAllocAttributeList>::other AllocAttrList;
+
+	const size_t THRESHOLD = 64;     //!< how full before the worker thread woken up
+	const size_t BUFFER_SIZE = 128;  //!< how many entries to hold in buffer
+	const std::chrono::milliseconds  SLEEP_TIME = std::chrono::milliseconds(100);
 public:
+
 	SimpleLogProcessor(LogProvider& p, AllocBackEnd& be)
 	: m_be(be)
 	, m_alloc(be)
-    , m_buffer(128)
+    , m_buffer(BUFFER_SIZE)
     , m_work_thread(&SimpleLogProcessor::DoWork, this)
 	, m_provider(p)
 	{
 
 	}
 
+	/**
+	 Worker thread that pulls data from buffer and sends to exporter.
+	 This will pull off as many as it can at once and forward to the
+	 exporter in batches. 
+	 */
 	void DoWork()
 	{
+		std::chrono::milliseconds timeout = SLEEP_TIME; // defualt
 		while (true)
 		{
-			size_t count = m_buffer.size();
+			m_buffer_cv.wait_for(timeout);
+			auto t1 = std::chrono::system_clock::now();
 
-			// TODO: limit count to a max value?
+			
+			
+
+			// get reference here to ensure exporter doesn't change during loop
+			LogExporter* exp = m_provider.get_exporter();
 
 			std::vector<LogRecord*> vec;
+			size_t count = m_buffer.size(); // TODO: limit count to a max value?
 			vec.reserve(count); // resever the number of entries needed
 
-			// get reference here to ensure it doesn't change during loop
-			LogExporter* exp = m_provider.get_exporter();
 			for (size_t i = 0; i<count; i++)
 			{
 				// translate from the RecordType type
@@ -879,8 +894,17 @@ public:
 				vec.push_back(r);
 			}
 
-			// no buffering, pass directly on
 			exp->export_record(vec.data(), vec.size());
+
+			auto t2 = std::chrono::system_clock::now();
+
+			timeout = std::chrono::duration_cast<std::chrono::milliseconds>(SLEEP_TIME - (t2 - t1));
+			
+			// took longer than the SLEEP_TIME, so don't sleep for next cycle
+			if (timeout.count() < 0)
+			{
+				timeout = std::chrono::milliseconds::zero();
+			}
 		}
 	}
 
@@ -915,6 +939,11 @@ public:
 	{
 		// add to circular buffer
 		m_buffer.add((RecordType*)rec);
+
+		// Wake up worker thread if buffer is
+		// above theshold full
+		if (m_buffer.size() > THRESHOLD)
+			m_buffer_cv.notify_one();
 	}
 
 private:
@@ -924,6 +953,30 @@ private:
 	CirculeBuffer<RecordType> m_buffer;
 	std::thread       m_work_thread;
 	LogProvider&      m_provider;
+
+	/**
+	 Condition Variable helper to take lock 
+	 */
+	struct ConditionVar
+	{
+		std::condition_variable cv;
+		std::mutex              lock;
+
+		template<class Rep, class Period>
+		void wait_for(std::chrono::duration<Rep, Period>& timeout)
+		{
+			std::unique_lock<std::mutex> l(lock);
+			cv.wait_for(l, timeout);
+		}
+
+		// wake up other thread
+		void notify_one()
+		{
+			cv.notify_one();
+		}
+	};
+
+	ConditionVar m_buffer_cv;
 
 };
 
@@ -1092,7 +1145,7 @@ public:
 		char* result = m_write + HDR_SIZE;
 
 		// place TRUE LENGTH and BUSY flag into header to reserve space
-		*(int*)m_write = (size + HDR_SIZE) | BUSY_FLAG;		
+		*(int*)m_write = (int)((size + HDR_SIZE) | BUSY_FLAG);		
 		// mark next as loop
 		*(int*)&m_write[n + HDR_SIZE] = 0;
 
@@ -1149,7 +1202,7 @@ public:
 
 			memcpy(dst, m_read+HDR_SIZE, result);
 			// round up
-			len = ((len + (HDR_SIZE-1)) / HDR_SIZE) * HDR_SIZE;
+			len = (uint32_t)(((len + (HDR_SIZE - 1)) / HDR_SIZE) * HDR_SIZE);
 
 			m_read += len;
 			unlock();

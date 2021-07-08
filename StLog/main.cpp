@@ -45,12 +45,12 @@ void PushThread(void *arg)
 		);
 		i+=1;
 
-		k2.store(k2 + 0.001);
+		k2.store(k2 + 0.001f);
 		{
 			LogScope scop2 = log2.begin_scope({
-				{"inner", "inner"},
+				{"inner", "inner value"},
 				});
-			log2.log(Severity::Info, "Nexted", {});
+			log2.log(Severity::Info, "Nested", {});
 		}
 		scope.end();
 		Sleep(100);
