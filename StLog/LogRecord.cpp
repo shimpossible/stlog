@@ -15,9 +15,10 @@ LogScope Logger::begin_scope(std::initializer_list<NamedAttribute> at)
 		attrs->add_attribute(*it);
 	}
 	LogScope scope(attrs);
+	scope.pro    = pro;  // keep track of processor that allocated this
 	scope.logger = this;
-	scope.next = m_scope;
-	m_scope = &scope;
+	scope.next   = m_scope;
+	m_scope      = &scope;
 	return scope;
 }
 
@@ -67,7 +68,6 @@ void LogScope::end()
 {
 	if (logger == 0) return;
 
-	LogProcessor* pro = logger->m_provider.get_processor();
 	pro->release_attribute_list(attrs);
 	logger->m_scope = next;
 	logger = 0;
@@ -76,15 +76,16 @@ void LogScope::end()
 LogScope::LogScope(LogScope&& other) noexcept
 {
 	logger = std::move(other.logger);
-	attrs = std::move(other.attrs);
-	next = std::move(other.next);
-
+	attrs  = std::move(other.attrs);
+	next   = std::move(other.next);
+	pro = std::move(other.pro);
 	assert(logger->m_scope == &other);
 	logger->m_scope = this;
 
+	other.pro    = nullptr;
 	other.logger = nullptr;
-	other.next = nullptr;
-	other.attrs = nullptr;
+	other.next   = nullptr;
+	other.attrs  = nullptr;
 }
 LogScope::~LogScope()
 {

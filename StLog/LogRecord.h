@@ -404,6 +404,7 @@ class LogScope
 	AttributeList* attrs;
 	LogScope* next;
 	Logger* logger;
+	LogProcessor* pro;
 
 	// called when LogScope is created in Logger
 	LogScope(AttributeList* at)
@@ -466,7 +467,10 @@ public:
 		return *logger;
 	}
 
-	LogProcessor* get_processor() { return m_proc; }
+	LogProcessor* get_processor() 
+	{ 
+		return m_proc;
+	}
 	LogExporter* get_exporter() { return m_exp;  }
 
 	LogProvider& with_processor(LogProcessor* proc)
@@ -912,10 +916,11 @@ private:
 	size_t m_capacity;
 	std::atomic<T*>* m_data;
 
+	// TODO: make this a spinlock on supported platform
 	std::mutex m_read_lock;
 };
 
-class SimpleLogProcessor : public LogProcessor
+class NoAllocLogProcessor : public LogProcessor
 {
 	typedef NoMallocLogRecord RecordType;
 	typedef Alloc<RecordType>::rebind<NoAllocAttributeList>::other AllocAttrList;
@@ -932,11 +937,11 @@ public:
 		//! max time between flushes of buffer
 		const std::chrono::milliseconds timeout = std::chrono::milliseconds(100);
 	};
-	SimpleLogProcessor(LogProvider& p, AllocBackEnd& be, const Options& opt = {})
+	NoAllocLogProcessor(LogProvider& p, AllocBackEnd& be, const Options& opt = {})
 	: m_be(be)
 	, m_alloc(be)
     , m_buffer(opt.buffer_size)
-    , m_work_thread(&SimpleLogProcessor::DoWork, this)
+    , m_work_thread(&NoAllocLogProcessor::DoWork, this)
 	, m_provider(p)
 	{
 		THRESHOLD = opt.threshold;
@@ -946,7 +951,7 @@ public:
 		if (THRESHOLD > BUFFER_SIZE) THRESHOLD = BUFFER_SIZE;
 	}
 
-	~SimpleLogProcessor()
+	~NoAllocLogProcessor()
 	{
 		shutdown();
 		m_work_thread.join();

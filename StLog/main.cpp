@@ -108,11 +108,11 @@ int main()
 	FILE* f;
 	fopen_s(&f, "log.txt", "w");
 	pro = new LogProvider();
-	PrintfLogExporter* ex = new PrintfLogExporter(f);
-	SimpleLogProcessor* p = new SimpleLogProcessor(*pro, be);
+	PrintfLogExporter  ex(f);
+	NoAllocLogProcessor p(*pro, be);
 
-	pro->with_exporter(ex)
-		.with_processor(p);
+	pro->with_exporter(&ex)
+		.with_processor(&p);
 
 
 	//PushThread((void*)1000);
@@ -123,5 +123,4 @@ int main()
 	Sleep(10000);
 
 	pro->with_processor(nullptr);
-	delete p;
 }
