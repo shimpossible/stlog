@@ -78,6 +78,49 @@ namespace std
 	};
 }
 
+struct TimeHelper
+{
+	// Converts from nanosec offset from 1970 epoc to
+	// iso8601 string with timezone
+	// @param ts_buff should be at least 35 bytes
+	static void ToIso8601(uint64_t nsec, char* ts_buff, size_t buff_len)
+	{
+		std::chrono::nanoseconds ts(nsec);
+		std::chrono::system_clock::duration d = std::chrono::duration_cast<std::chrono::system_clock::duration>(ts);
+		std::chrono::system_clock::time_point tp(d);
+
+		// nsec part
+		uint64_t fractional = nsec % 1000000000;
+
+		// convert from systemtime into ISO8601 format
+		std::time_t tt = std::chrono::system_clock::to_time_t(tp);
+		std::tm* tm = localtime(&tt);
+		size_t len = strftime(ts_buff, buff_len, "%FT%T", tm);
+
+		// compute the time in gmt and local, and get the difference
+		std::tm gm_ = *gmtime(&tt);
+		std::tm loc_ = *localtime(&tt);
+		// correctly compute DST..  the tm values
+		// are incorrect for somereason
+		gm_.tm_isdst = -1;
+		loc_.tm_isdst = -1;
+		// convert back to seconds.  tm_isdst is set to -1 to force mktime
+		// to calculate the correct DST value.
+		time_t gm = mktime(&gm_);
+		time_t loc = mktime(&loc_);
+		time_t diff = loc - gm;  // difference in seconds
+
+		// compute tz offsets
+
+		// timezone offset
+		int8_t tz_hour = diff / 3600;
+		int8_t tz_min = (diff % 3600) / 60;
+
+		// append nsec and TZ offset into ISO8601 string
+		sprintf_s(ts_buff + len, buff_len - len, ".%09llu%+03d:%02d", fractional, tz_hour, tz_min);
+	}
+};
+
 enum class AttributeType : uint8_t
 {
 	type_u8,
@@ -267,7 +310,7 @@ class LogRecord
 public:
 	virtual ~LogRecord() {}
 
-	virtual void set_timestamp(uint64_t nsec) = 0;
+	virtual void set_timestamp(int64_t nsec) = 0;
 	virtual void set_severity(Severity severity) = 0;
 	void set_name(const char* name)
 	{
@@ -309,6 +352,32 @@ public:
 	*/
 	virtual void add_record(LogRecord* rec) = 0;
 
+};
+
+class NopLogProcess : public LogProcessor
+{
+public:
+	//! Creates new LogRecord to be filled by Logger
+	virtual LogRecord* create_record() { return nullptr;  }
+
+	/**
+	 Used for scopes.  Creates storage for attributes in
+	 a scope
+	 */
+	virtual AttributeList* create_attribute_list() { return nullptr; }
+	virtual void release_attribute_list(AttributeList* attrs)
+	{
+		// do nothing..?
+	}
+
+	/**
+	Adds a record to be processed.  Processor will
+	release resources for the record
+	*/
+	virtual void add_record(LogRecord* rec)
+	{
+		// do nothing
+	}
 };
 
 class LogExporter
@@ -402,6 +471,7 @@ public:
 
 	LogProvider& with_processor(LogProcessor* proc)
 	{
+		if (proc == nullptr) proc = &m_nop_proc;
 		m_proc = proc;
 
 		return *this;
@@ -413,6 +483,7 @@ public:
 	}
 protected:
 
+	NopLogProcess  m_nop_proc;
 	LogProcessor* m_proc;
 	LogExporter* m_exp;
 
@@ -671,7 +742,7 @@ public:
 			}
 		}
 	}
-	virtual void set_timestamp(uint64_t nsec)
+	virtual void set_timestamp(int64_t nsec)
 	{
 		ts = nsec;
 	}
@@ -875,6 +946,12 @@ public:
 		if (THRESHOLD > BUFFER_SIZE) THRESHOLD = BUFFER_SIZE;
 	}
 
+	~SimpleLogProcessor()
+	{
+		shutdown();
+		m_work_thread.join();
+	}
+
 	/**
 	 Worker thread that pulls data from buffer and sends to exporter.
 	 This will pull off as many as it can at once and forward to the
@@ -883,48 +960,12 @@ public:
 	void DoWork()
 	{
 		std::chrono::milliseconds timeout = SLEEP_TIME; // defualt
-		while (true)
+		while (m_shutdown == false)
 		{
 			//m_buffer_cv.wait_for(timeout);
 			auto t1 = std::chrono::system_clock::now();
 
-			// get reference here to ensure exporter doesn't change during loop
-			LogExporter* exp = m_provider.get_exporter();
-
-			std::vector<LogRecord*> vec;
-			size_t count = m_buffer.size(); // TODO: limit count to a max value?
-			vec.reserve(count); // resever the number of entries needed
-
-			for (size_t i = 0; i<count; i++)
-			{
-				LogRecord* r = exp->create_record();
-				if (r == nullptr) break;  // exporter is out of records?
-
-				// translate from the RecordType type
-				// to whatever the exporter uses
-				RecordType* rec = m_buffer.consume();
-
-				r->set_message(rec->message.data);
-				r->set_name(rec->name.data);
-				r->set_severity(rec->severity);
-				r->set_timestamp(rec->ts);
-
-				for (auto it = rec->m_attrs.begin();
-					it != rec->m_attrs.end();
-					it++)
-				{
-					r->add_attribute(it->first, it->second);
-				}
-
-				rec->~RecordType();
-				m_alloc.deallocate((RecordType*)rec, 1);
-
-				vec.push_back(r);
-			}
-
-			dropped = 0;
-
-			exp->export_record(vec.data(), vec.size());
+			export_records();
 
 			auto t2 = std::chrono::system_clock::now();
 
@@ -935,6 +976,14 @@ public:
 			{
 				timeout = std::chrono::milliseconds::zero();
 			}
+		}
+
+		// drain any remaining
+		// need to keep looking while add_record is called, incase
+		// one was received while this was draining
+		while ( (m_buffer.size() > 0) || m_busy)
+		{
+			export_records();
 		}
 	}
 
@@ -968,8 +1017,17 @@ public:
 	*/
 	virtual void add_record(LogRecord* rec)
 	{
-		LogRecord* lost = nullptr;
-		
+		if (m_shutdown)
+		{
+			// don't push to buffer, but free resources
+			rec->~LogRecord();
+			m_alloc.deallocate((RecordType*)rec, 1);
+			return;
+		}
+
+		m_busy = true;
+
+		LogRecord* lost = nullptr;		
 		do 
 		{
 			// add to circular buffer
@@ -987,16 +1045,64 @@ public:
 		// above theshold full
 		if (m_buffer.size() >= THRESHOLD)
 			m_buffer_cv.notify_one();
+
+		m_busy = false;
 	}
 
+	void shutdown()
+	{
+		m_shutdown = true;
+	}
 private:
+
+	void export_records()
+	{
+		// get reference here to ensure exporter doesn't change during loop
+		LogExporter* exp = m_provider.get_exporter();
+
+		std::vector<LogRecord*> vec;
+		size_t count = m_buffer.size(); // TODO: limit count to a max value?
+		vec.reserve(count); // resever the number of entries needed
+
+		for (size_t i = 0; i < count; i++)
+		{
+			LogRecord* r = exp->create_record();
+			if (r == nullptr) break;  // exporter is out of records?
+
+			// translate from the RecordType type
+			// to whatever the exporter uses
+			RecordType* rec = m_buffer.consume();
+
+			r->set_message(rec->message.data);
+			r->set_name(rec->name.data);
+			r->set_severity(rec->severity);
+			r->set_timestamp(rec->ts);
+
+			for (auto it = rec->m_attrs.begin();
+				it != rec->m_attrs.end();
+				it++)
+			{
+				r->add_attribute(it->first, it->second);
+			}
+
+			rec->~RecordType();
+			m_alloc.deallocate((RecordType*)rec, 1);
+
+			vec.push_back(r);
+		}
+
+		dropped = 0;
+
+		exp->export_record(vec.data(), vec.size());
+	}
 
 	AllocBackEnd&     m_be;
 	Alloc<RecordType> m_alloc;
 	CirculeBuffer<RecordType> m_buffer;
-	std::thread       m_work_thread;
-	LogProvider&      m_provider;
-
+	std::thread        m_work_thread;
+	LogProvider&       m_provider;
+	std::atomic<bool>  m_shutdown;
+	std::atomic<bool>  m_busy;   //<! while 'add_record'
 	/**
 	 Condition Variable helper to take lock 
 	 */
@@ -1061,7 +1167,7 @@ public:
 		m_attrs.clear();
 	}
 
-	virtual void set_timestamp(uint64_t nsec)
+	virtual void set_timestamp(int64_t nsec)
 	{
 		ts = nsec;
 	}
@@ -1104,7 +1210,7 @@ public:
 		}
 	}
 
-	uint64_t         ts;
+	int64_t          ts;
 	Severity         severity;
 	Span<const char> name;
 	Span<const char> message;
@@ -1418,10 +1524,17 @@ public:
 	{
 		m_dst = dst;
 
-		for (int i = 0; i < 4; i++)
+		for (int i = 0; i < 128; i++)
 			logPool.push_back(new SimpleLogRecord());
 	}
 
+	~PrintfLogExporter()
+	{
+		for (int i = 0; i < logPool.size(); i++)
+		{
+			delete logPool[i];
+		}
+	}
 	//! Creates a new LogRecord that can be exported
 	virtual LogRecord* create_record()
 	{
@@ -1440,26 +1553,19 @@ public:
 		}
 	}
 
-	int count = 0;
-	std::chrono::system_clock::time_point next;
 	//! Export a record and release resources 
 	virtual void export_record(LogRecord* rec)
 	{
-		std::chrono::system_clock::time_point tp = std::chrono::system_clock::now();
-		
-		if (tp > next)
-		{
-			printf("####### ##### ##### %d PER SEC\n", count);
-			count = 0;
-			next = tp + std::chrono::seconds(1);
-		}
-		count++;
-
 		SimpleLogRecord* s = (SimpleLogRecord*)rec;
 
 		fprintf(m_dst,"name: %.*s\n", (int)s->name.len, s->name.data);
 		fprintf(m_dst, " msg: %.*s\n", (int)s->message.len, s->message.data);
-		fprintf(m_dst, "  ts: %llu\n", s->ts);
+
+		char ts_buff[48];
+		TimeHelper::ToIso8601(s->ts, ts_buff, sizeof(ts_buff));
+
+		fprintf(m_dst, "  ts: %s\n", ts_buff);
+
 		fprintf(m_dst, " sev: %d\n", s->severity);
 		for (auto it = s->m_attrs.begin();
 			      it != s->m_attrs.end();
@@ -1479,5 +1585,4 @@ public:
 private:
 
 	FILE* m_dst;
-	SimpleLogRecord  m_record;
 };

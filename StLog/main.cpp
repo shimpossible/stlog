@@ -41,16 +41,19 @@ void PushThread(void *arg)
 			});
 
 		int _i = i;
+		while (!i.compare_exchange_weak(_i, _i + 1))
+			_i = i;
+
+		float _k2 = k2;
+		while (!k2.compare_exchange_weak(_k2, _k2 + 0.001f))
+			_k2 = k2;
 		logger.log(Severity::Info, "Hello World",
 			{
-				{"key1", (int)i},
+				{"key1", (int)_i},
 				{"key2", k2.load()},
 				{"key3", "asdf" + std::to_string(k2) + " " + std::to_string(i)},
 			}
 		);
-		i+=1;
-
-		k2.store(k2 + 0.001f);
 		{
 			LogScope scop2 = log2.begin_scope({
 				{"inner", "inner value"},
@@ -117,8 +120,8 @@ int main()
 	_beginthread(PushThread, 0, (void*)99999999);
 	_beginthread(PushThread, 0, (void*)99999999);
 
-	while (true)
-	{
-		Sleep(1000);
-	}
+	Sleep(10000);
+
+	pro->with_processor(nullptr);
+	delete p;
 }

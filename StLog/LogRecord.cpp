@@ -3,7 +3,10 @@
 LogScope Logger::begin_scope(std::initializer_list<NamedAttribute> at)
 {
 	LogProcessor* pro = m_provider.get_processor();
+	if (pro == nullptr) return LogScope(nullptr);
+
 	AttributeList* attrs = pro->create_attribute_list();
+	if (attrs == nullptr) return LogScope(nullptr);
 
 	for (const NamedAttribute* it = at.begin();
 		it < at.end();
@@ -22,9 +25,15 @@ void Logger::log(Severity sev, const char* msg, std::initializer_list<NamedAttri
 {
 	LogProcessor* pro = m_provider.get_processor();
 	LogRecord* r = pro->create_record();
-	uint64_t nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(
-		std::chrono::system_clock::now().time_since_epoch()
-		).count();
+
+	if (pro == nullptr) return;
+	if (r == nullptr) return;
+
+
+	std::chrono::system_clock::time_point tp = std::chrono::system_clock::now();
+
+	// convert to nanoseconds.  System time is usually 100nsec
+	uint64_t nsec = std::chrono::duration_cast<std::chrono::nanoseconds> (tp.time_since_epoch() ).count();
 
 	r->set_timestamp(nsec);
 	r->set_name(m_name);
