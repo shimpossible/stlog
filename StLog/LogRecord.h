@@ -422,10 +422,6 @@ protected:
 
 struct AllocBackEnd
 {
-	static const int COUNT = 2048;
-	static const int BUFFERS = 4;
-	char* buff[4];
-
 	// to help in lock-free need to know when index
 	// has changed and been set back.  To do this there
 	// is a sequence modification counter.  This limits
@@ -443,38 +439,49 @@ struct AllocBackEnd
 				;
 		}
 	};
-	std::atomic<SeqCounter> free_list[4];
-	size_t size[4];
 
-	int MAX[4];
-
-	AllocBackEnd()
+	struct Buffer
 	{
-		memset(MAX, 0, sizeof(MAX));
+		size_t size;    //!< bytes per entry
+		size_t count;	//!< total number of entries
+		char*  buffer;  //!< start of buffer.  end is buffer + size*count
 
-		size[0] = 16;
-		size[1] = 64;
-		size[2] = 128;
-		size[3] = 256;
+		int    MAX;
+	};
+	
+	std::atomic<SeqCounter>* free_list;
+	Buffer*                  m_buffer;
+	size_t                   m_count;
 
+	AllocBackEnd( std::initializer_list<Buffer> buffers)
+	{
+		m_count   = buffers.end() - buffers.begin();
 
-		for (int i = 0; i < BUFFERS; i++)
+		m_buffer = new Buffer[m_count];		
+		free_list = new std::atomic<SeqCounter>[m_count];
+
+		for (int i = 0; i < m_count; i++)
 		{
 			free_list[i] = { 0,0 };
 		}
 
-		for (int k = 0; k < BUFFERS; k++)
+		// build free list
+		for (size_t k = 0; k < m_count; k++)  // each size
 		{
-			buff[k] = (char*)malloc(size[k] * COUNT);
-			int* p = (int*)buff[k];
+			Buffer& b = m_buffer[k];
+			b = buffers.begin()[k];
+
+			int* p = (int*)b.buffer;
 			assert(p != 0);
-			for (int i = 0; i < COUNT; i++)
+
+			// each block in buffer, point to next
+			for (size_t i = 0; i < b.count; i++)
 			{
-				p[i * size[k] / sizeof(int)] = i + 1;
+				p[i * b.size / sizeof(int)] = i + 1;
 			}
 
 			// last pointer is invalid
-			p[(COUNT - 1) * size[k] / sizeof(int)] = -1;
+			p[(b.count - 1) * b.size / sizeof(int)] = -1;
 		}
 	}
 
@@ -483,9 +490,11 @@ struct AllocBackEnd
 		void* rst = 0;
 
 		// find the smallest size that meets the requested size
-		for (int i = 0; i < BUFFERS; i++)
+		for (int i = 0; i < m_count; i++)
 		{
-			if (n > size[i]) continue;
+			Buffer& b = m_buffer[i];
+
+			if (n > b.size) continue;
 
 			uint32_t* next = 0;
 
@@ -497,14 +506,16 @@ struct AllocBackEnd
 				// latest free list pointer
 				SeqCounter curr = free_list[i];
 
-				if (curr.index > COUNT)
+				if (curr.index > b.count)
 					break;  // empty free list
 
-				next = (uint32_t*)&(buff[i][size[i] * (curr.index)]);
+				next = (uint32_t*)&(b.buffer[b.size * (curr.index)]);
 
-				assert((char*)next >= buff[i]);
+				// not before start of buffer
+				assert((char*)next >= b.buffer);
+
 				int last = *next;
-				if ((*next >= COUNT) && (free_list[i].load() ==  curr))
+				if ((*next >= b.count) && (free_list[i].load() ==  curr))
 				{
 					while (true);
 					break;  // empty free list
@@ -517,7 +528,7 @@ struct AllocBackEnd
 				nxt.index = *next;
 				nxt.seq = curr.seq + 1;
 
-				if (nxt.index >= COUNT)
+				if (nxt.index >= b.count)
 				{
 					while (free_list[i].load().index == curr.index);
 				}
@@ -525,14 +536,14 @@ struct AllocBackEnd
 				// if free_list changed, loop again
 				if (!free_list[i].compare_exchange_weak(curr, nxt)) continue;
 
-				if (nxt.index >= COUNT)
+				if (nxt.index >= b.count)
 					while (true);
 
-				if (MAX[i] < nxt.index)
+				if (b.MAX < nxt.index)
 				{
-					MAX[i] = nxt.index;
+					b.MAX = nxt.index;
 					if (i == 1)
-						printf("MX %d\n", MAX[i]);
+						printf("MX %d\n", b.MAX);
 				}
 
 				break;
@@ -548,16 +559,18 @@ struct AllocBackEnd
 
 	void dealloc(char* ptr)
 	{
-		for (int i = 0; i < BUFFERS; i++)
+		for (int i = 0; i < m_count; i++)
 		{
-			char* begin = buff[i];
-			char* end = begin + COUNT * size[i];  // end of allocated range
+			Buffer& b = m_buffer[i];
+
+			char* begin = b.buffer;
+			char* end = begin + b.count * b.size;  // end of allocated range
 
 			// in allocated memory range?
 			if (ptr >= begin && ptr < end)
 			{
 				SeqCounter idx;
-				idx.index = (uint16_t)((ptr - begin) / size[i]);  // block number;
+				idx.index = (uint16_t)((ptr - begin) / b.size );  // block number;
 
 				SeqCounter next;
 				do
@@ -573,7 +586,7 @@ struct AllocBackEnd
 					// should be accessing it right now
 					*(int*)ptr = next.index;
 
-					if (next.index >= COUNT)
+					if (next.index >= b.count)
 						break;  // empty free list
 
 					idx.seq = next.seq + 1;
@@ -755,15 +768,16 @@ public:
 		m_write = 0;
 	}
 
-	void add(T* ptr)
+	T* add(T* ptr)
 	{
 		while (true)
 		{
 			// grab local copy
 			uint64_t w = m_write;
-			if (size() >= m_capacity-1)
+			if (size() >= m_capacity)
 			{
-				continue;
+				// drop oldest..				
+				return consume();
 				//while (true); // out of space?!
 			}
 
@@ -791,10 +805,13 @@ public:
 			// the index did not change so everything was successful
 			break;
 		}
+		return nullptr;
 	}
 
 	T* consume()
 	{
+		std::lock_guard<std::mutex> lg(m_read_lock);
+
 		if (m_write == m_read)
 		{
 			return nullptr;
@@ -823,6 +840,8 @@ private:
 	std::atomic<uint64_t> m_write;
 	size_t m_capacity;
 	std::atomic<T*>* m_data;
+
+	std::mutex m_read_lock;
 };
 
 class SimpleLogProcessor : public LogProcessor
@@ -830,19 +849,30 @@ class SimpleLogProcessor : public LogProcessor
 	typedef NoMallocLogRecord RecordType;
 	typedef Alloc<RecordType>::rebind<NoAllocAttributeList>::other AllocAttrList;
 
-	const size_t THRESHOLD = 64;     //!< how full before the worker thread woken up
-	const size_t BUFFER_SIZE = 128;  //!< how many entries to hold in buffer
-	const std::chrono::milliseconds  SLEEP_TIME = std::chrono::milliseconds(100);
+	size_t THRESHOLD;
+	size_t BUFFER_SIZE;
+	std::chrono::milliseconds  SLEEP_TIME;
 public:
 
-	SimpleLogProcessor(LogProvider& p, AllocBackEnd& be)
+	struct Options
+	{
+		size_t  buffer_size = 128;		//!< Size of ring buffer in entries
+		size_t  threshold   = 64;		//!< how full buffer should be, before forced flush
+		//! max time between flushes of buffer
+		const std::chrono::milliseconds timeout = std::chrono::milliseconds(100);
+	};
+	SimpleLogProcessor(LogProvider& p, AllocBackEnd& be, const Options& opt = {})
 	: m_be(be)
 	, m_alloc(be)
-    , m_buffer(BUFFER_SIZE)
+    , m_buffer(opt.buffer_size)
     , m_work_thread(&SimpleLogProcessor::DoWork, this)
 	, m_provider(p)
 	{
+		THRESHOLD = opt.threshold;
+		BUFFER_SIZE = opt.buffer_size;
+		SLEEP_TIME = opt.timeout;
 
+		if (THRESHOLD > BUFFER_SIZE) THRESHOLD = BUFFER_SIZE;
 	}
 
 	/**
@@ -855,11 +885,8 @@ public:
 		std::chrono::milliseconds timeout = SLEEP_TIME; // defualt
 		while (true)
 		{
-			m_buffer_cv.wait_for(timeout);
+			//m_buffer_cv.wait_for(timeout);
 			auto t1 = std::chrono::system_clock::now();
-
-			
-			
 
 			// get reference here to ensure exporter doesn't change during loop
 			LogExporter* exp = m_provider.get_exporter();
@@ -870,11 +897,12 @@ public:
 
 			for (size_t i = 0; i<count; i++)
 			{
+				LogRecord* r = exp->create_record();
+				if (r == nullptr) break;  // exporter is out of records?
+
 				// translate from the RecordType type
 				// to whatever the exporter uses
 				RecordType* rec = m_buffer.consume();
-				LogRecord* r = exp->create_record();
-				if (r == nullptr) break;  // exporter is out of records?
 
 				r->set_message(rec->message.data);
 				r->set_name(rec->name.data);
@@ -893,6 +921,8 @@ public:
 
 				vec.push_back(r);
 			}
+
+			dropped = 0;
 
 			exp->export_record(vec.data(), vec.size());
 
@@ -931,18 +961,31 @@ public:
 		return slr;
 	}
 
+	int dropped = 0;
 	/**
 	Adds a record to be processed.  Processor will
 	release resources for the record
 	*/
 	virtual void add_record(LogRecord* rec)
 	{
-		// add to circular buffer
-		m_buffer.add((RecordType*)rec);
+		LogRecord* lost = nullptr;
+		
+		do 
+		{
+			// add to circular buffer
+			lost = m_buffer.add((RecordType*)rec);
 
+			// had to drop one?
+			if (lost!=nullptr)
+			{
+				dropped++;
+				lost->~LogRecord();
+				m_alloc.deallocate((RecordType*)lost, 1);
+			}
+		} while (lost!=nullptr);
 		// Wake up worker thread if buffer is
 		// above theshold full
-		if (m_buffer.size() > THRESHOLD)
+		if (m_buffer.size() >= THRESHOLD)
 			m_buffer_cv.notify_one();
 	}
 
@@ -1306,56 +1349,61 @@ private:
  */
 struct AttrPrinter
 {
+	FILE* dst;
+	AttrPrinter(FILE* f)
+	{
+		dst = f;
+	}
 	void operator()(bool b)
 	{
-		printf("%d", b);
+		fprintf(dst,"%d", b);
 	}
 
 	void operator()(float b)
 	{
-		printf("%f", b);
+		fprintf(dst, "%f", b);
 	}
 	void operator()(double b)
 	{
-		printf("%lf", b);
+		fprintf(dst, "%lf", b);
 	}
 	void operator()(int8_t b)
 	{
-		printf("%d", b);
+		fprintf(dst, "%d", b);
 	}
 	void operator()(int16_t b)
 	{
-		printf("%d", b);
+		fprintf(dst, "%d", b);
 	}
 	void operator()(int32_t b)
 	{
-		printf("%d", b);
+		fprintf(dst, "%d", b);
 	}
 	void operator()(int64_t b)
 	{
-		printf("%lld", b);
+		fprintf(dst, "%lld", b);
 	}
 
 	void operator()(uint8_t b)
 	{
-		printf("%u", b);
+		fprintf(dst, "%u", b);
 	}
 	void operator()(uint16_t b)
 	{
-		printf("%u", b);
+		fprintf(dst, "%u", b);
 	}
 	void operator()(uint32_t b)
 	{
-		printf("%u", b);
+		fprintf(dst, "%u", b);
 	}
 	void operator()(uint64_t b)
 	{
-		printf("%llu", b);
+		fprintf(dst, "%llu", b);
 	}
 
 	void operator()(const Span<const char>& b)
 	{
-		printf("%.*s", (int)b.len, b.data);
+		fprintf(dst, "%.*s", (int)b.len, b.data);
 	}
 };
 
@@ -1364,15 +1412,24 @@ struct AttrPrinter
  */
 class PrintfLogExporter : public LogExporter 
 {
+	std::vector<SimpleLogRecord*> logPool;
 public:
-	PrintfLogExporter(AllocBackEnd& be)
+	PrintfLogExporter(FILE* dst)
 	{
+		m_dst = dst;
+
+		for (int i = 0; i < 4; i++)
+			logPool.push_back(new SimpleLogRecord());
 	}
+
 	//! Creates a new LogRecord that can be exported
 	virtual LogRecord* create_record()
 	{
-		// TODO: use a pool of records..
-		return new SimpleLogRecord();
+		if (logPool.size() == 0) return 0;
+
+		LogRecord* front = logPool.back();
+		logPool.pop_back();
+		return front;
 	}
 
 	virtual void export_record(LogRecord** begin, size_t len)
@@ -1383,30 +1440,44 @@ public:
 		}
 	}
 
+	int count = 0;
+	std::chrono::system_clock::time_point next;
 	//! Export a record and release resources 
 	virtual void export_record(LogRecord* rec)
 	{
+		std::chrono::system_clock::time_point tp = std::chrono::system_clock::now();
+		
+		if (tp > next)
+		{
+			printf("####### ##### ##### %d PER SEC\n", count);
+			count = 0;
+			next = tp + std::chrono::seconds(1);
+		}
+		count++;
+
 		SimpleLogRecord* s = (SimpleLogRecord*)rec;
 
-		printf("name: %.*s\n", (int)s->name.len, s->name.data);
-		printf(" msg: %.*s\n", (int)s->message.len, s->message.data);
-		printf("  ts: %llu\n", s->ts);
-		printf(" sev: %d\n", s->severity);
+		fprintf(m_dst,"name: %.*s\n", (int)s->name.len, s->name.data);
+		fprintf(m_dst, " msg: %.*s\n", (int)s->message.len, s->message.data);
+		fprintf(m_dst, "  ts: %llu\n", s->ts);
+		fprintf(m_dst, " sev: %d\n", s->severity);
 		for (auto it = s->m_attrs.begin();
 			      it != s->m_attrs.end();
 			      it++)
 		{
-			printf("\t%s : ", it->first.c_str());
-			AttrPrinter ptr;
+			fprintf(m_dst, "\t%s : ", it->first.c_str());
+			AttrPrinter ptr(m_dst);
 			visit(ptr, it->second);
-			printf("\n");
+			fprintf(m_dst, "\n");
 		}
 		
 		// release
-		delete rec;
+		s->reset();
+		logPool.push_back(s);
 	}
 
 private:
 
+	FILE* m_dst;
 	SimpleLogRecord  m_record;
 };

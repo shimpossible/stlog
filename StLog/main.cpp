@@ -14,7 +14,12 @@
 
 thread_local LogScope* Logger::m_scope = 0;
 
-AllocBackEnd be;
+AllocBackEnd be({
+	{16,  2048, (char*)malloc(16 * 2048) },
+	{64,  4096, (char*)malloc(64 * 4096) },
+	{128, 512,  (char*)malloc(128 * 512) },
+	{256, 512,  (char*)malloc(256 * 512) },
+});
 std::atomic<int> i = 0;
 std::atomic<float> k2 = 0;
 
@@ -53,7 +58,7 @@ void PushThread(void *arg)
 			log2.log(Severity::Info, "Nested", {});
 		}
 		scope.end();
-		Sleep(100);
+		//Sleep(1);
 	}
 }
 
@@ -97,8 +102,10 @@ int main()
 	_CrtMemDumpAllObjectsSince(&state);
 	*/
 
+	FILE* f;
+	fopen_s(&f, "log.txt", "w");
 	pro = new LogProvider();
-	PrintfLogExporter* ex = new PrintfLogExporter(be);
+	PrintfLogExporter* ex = new PrintfLogExporter(f);
 	SimpleLogProcessor* p = new SimpleLogProcessor(*pro, be);
 
 	pro->with_exporter(ex)
