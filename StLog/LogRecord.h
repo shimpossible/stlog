@@ -117,7 +117,7 @@ struct TimeHelper
 		int8_t tz_min = (diff % 3600) / 60;
 
 		// append nsec and TZ offset into ISO8601 string
-		sprintf_s(ts_buff + len, buff_len - len, ".%09llu%+03d:%02d", fractional, tz_hour, tz_min);
+		sprintf(ts_buff + len, ".%09llu%+03d:%02d", fractional, tz_hour, tz_min);
 	}
 };
 
@@ -394,7 +394,6 @@ public:
 	//! Export range of records and releases resources
 	virtual void export_record(LogRecord** begin, size_t len) = 0;
 };
-
 
 class Logger;
 
@@ -1135,9 +1134,9 @@ private:
 };
 
 /**
- Implements a LogRecord using an unordered_map and duplicates
- strings.  Allowing the source strings to be released. Recommend
- to use this on the exporter backend only
+ Implements a LogRecord using an unordered_map with std::string keys
+ and duplicates string attributes.  Allowing the source strings to be released. 
+ Recommend to use this on the exporter backend only, as it allocates memory
  */
 class SimpleLogRecord : public LogRecord
 {
@@ -1243,216 +1242,6 @@ protected:
 		assert(dst.data != 0);
 		memcpy((char*)dst.data, other.data, other.len);
 	}
-};
-
-/**
- A Ring buffer supporting entries of arbatrary size.  Each is prefixed
- with a 32bit length.  If no space available at the end, older entries are
- dropped until there is enough space available
- */
-class RingBuffer
-{
-public:
-	RingBuffer(size_t len)
-	{
-		m_seq_r = 0;
-		m_seq_w = 0;
-		m_buffer = (char*)malloc(len);
-		m_read  = m_buffer;
-		m_write = m_buffer;
-		m_len   = len;
-	}
-
-	~RingBuffer()
-	{
-		free(m_buffer);
-	}
-
-	// Get buffer of size n3
-	char* reserve(size_t size)
-	{
-		// round to next 32bit
-		size_t padding = (HDR_SIZE-(size&3))&3;
-		size_t n = size + padding;  // actaul amount that is needed
-
-		// TODO: LOCK
-		lock();
-
-
-		// while there are items to drop
-		while (m_seq_r < m_seq_w)
-		{
-			// how much space is available?
-			size_t avail = available();
-			if (avail >= (n + HDR_SIZE*2)) break;
-			// need more space..
-			drop();
-		}
-
-		// not enough space at end?
-		if ((m_write + n) > (m_buffer + m_len))
-		{
-			// wrap around
-			m_write = m_buffer;
-		}
-
-		char* result = m_write + HDR_SIZE;
-
-		// place TRUE LENGTH and BUSY flag into header to reserve space
-		*(int*)m_write = (int)((size + HDR_SIZE) | BUSY_FLAG);		
-		// mark next as loop
-		*(int*)&m_write[n + HDR_SIZE] = 0;
-
-		m_write += n + HDR_SIZE;
-
-		unlock();
-
-		// return pointer AFTER header
-		return result;
-	}
-
-	// mark buffer as complete and update counters
-	void commit(char* buff)
-	{
-		int* ptr = (int*)buff;
-		// unset busy flag
-		ptr[-1] &= ~BUSY_FLAG;
-
-		m_seq_w++; // finally update sequence to indicate new data
-	}
-
-	// @brief    Read from buffer.  if DST is too small, data will be truncated and lost
-	//           This is meant to be called from 1 thread at a time
-	// 
-	// @param dst    where to copy data
-	// @param avail  Size of dst
-	// @returns Number of bytes copied
-	size_t consume(char* dst, size_t avail)
-	{
-		size_t result = 0;
-
-		for (int i = 0; i < 2; i++) // 2 loops, incase first header is 'return to start' len pointer
-		{
-			if (m_seq_r == m_seq_w) return 0;
-
-			lock();
-			uint32_t len = *(int*)m_read;
-
-			if (len & BUSY_FLAG)
-			{
-				// Shouldn't ever get here.. reading faster than writing?
-				unlock();
-				return 0;
-			}
-			if (len == 0) // loop flag?
-			{
-				m_read = m_buffer;
-				unlock();
-				continue; // try again
-			}
-
-			result = len-HDR_SIZE;
-			if (result > avail) result = avail;
-
-			memcpy(dst, m_read+HDR_SIZE, result);
-			// round up
-			len = (uint32_t)(((len + (HDR_SIZE - 1)) / HDR_SIZE) * HDR_SIZE);
-
-			m_read += len;
-			unlock();
-
-			// loop
-			if (m_read >= m_buffer + m_len) m_read = m_buffer;
-
-			m_seq_r++;
-			break;
-		}
-
-		return result;
-	}
-
-private:
-
-	const uint32_t BUSY_FLAG = 0x80000000;
-	const size_t HDR_SIZE    = 4;
-
-	std::mutex  m_mutex;
-	void lock()
-	{
-		m_mutex.lock();
-		// TODO: platform specific lock
-	}
-
-	void unlock()
-	{
-		// TODO: platform specific lock
-		m_mutex.unlock();
-	}
-
-	// drop entry.  This should be called
-	// with lock held
-	void drop()
-	{
-		if (m_seq_r < m_seq_w)
-		{
-			uint32_t len = *(int*)m_read;
-
-			// entry is reserved..
-			if (len & BUSY_FLAG)
-			{
-			    //	return;
-				// buffer filled up and we need one that is
-				// in use... which means another thread is
-				// writing to it possibly
-				len &= ~BUSY_FLAG;
-			}
-
-			if (len == 0) m_read = m_buffer; // loop?
-			else
-			{
-				// round len 
-				size_t padding = (HDR_SIZE - (len & 3)) & 3;
-				m_read += len + padding;
-				// loop
-				if (m_read >= m_buffer + m_len) m_read = m_buffer;
-				m_seq_r++;
-			}
-		}
-	}
-	// calculate available space in a continuous block after m_Write
-	// should be called with lock held
-	size_t available()
-	{
-		if (m_write < m_read)
-		{
-			/// ######------######
-			//  write^      ^read
-
-			// available space is difference of pointers
-			return m_read - m_write;
-		}
-		else
-		{
-			//  -----#############-----
-			//  read^       write^
-			
-			// need space to END of buffer
-			size_t a =  m_len - (m_write - m_buffer);
-			// or from start
-			size_t b = m_read - m_buffer;
-
-			// return larger of 2
-			if (b > a) return b;
-			return a;
-		}
-	}
-
-	std::atomic<uint64_t> m_seq_r;
-	std::atomic<uint64_t> m_seq_w;
-	char*   m_read;
-	char*   m_write;
-	char*   m_buffer;
-	size_t  m_len;
 };
 
 /**
