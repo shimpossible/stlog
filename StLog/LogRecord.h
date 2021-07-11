@@ -326,7 +326,7 @@ public:
 	virtual void set_name(Span<const char>&& name) = 0;
 	virtual void set_message(Span<const char>&& message) = 0;
 
-	virtual void add_attribute(const Span<const char>& key, const AttributeValue& attr) = 0;
+	virtual void add_attribute(const char* key, const AttributeValue& attr) = 0;
 };
 
 /**
@@ -395,6 +395,22 @@ public:
 	virtual void export_record(LogRecord** begin, size_t len) = 0;
 };
 
+class NopLogExporter : public LogExporter
+{
+public:
+	virtual LogRecord* create_record() { return nullptr; }
+
+	//! Export a record and release resources 
+	virtual void export_record(LogRecord* rec)
+	{
+	}
+
+	//! Export range of records and releases resources
+	virtual void export_record(LogRecord** begin, size_t len)
+	{
+	}
+};
+
 class Logger;
 
 class LogScope
@@ -450,6 +466,12 @@ private:
 class LogProvider
 {
 public:
+	LogProvider()
+	{
+		m_proc = &m_nop_proc;
+		m_exp = &m_nop_exp;
+	}
+
 	Logger& get(const char* name)
 	{
 		// holds lock while in the function
@@ -487,6 +509,7 @@ public:
 protected:
 
 	NopLogProcess  m_nop_proc;
+	NopLogExporter m_nop_exp;
 	LogProcessor* m_proc;
 	LogExporter* m_exp;
 
@@ -519,7 +542,7 @@ struct AllocBackEnd
 		size_t size;    //!< bytes per entry
 		size_t count;	//!< total number of entries
 		char*  buffer;  //!< start of buffer.  end is buffer + size*count
-
+		char*  end;
 		int    MAX;
 	};
 	
@@ -544,6 +567,8 @@ struct AllocBackEnd
 		{
 			Buffer& b = m_buffer[k];
 			b = buffers.begin()[k];
+			b.end = b.buffer + b.size * b.count;
+			b.MAX = 0;
 
 			int* p = (int*)b.buffer;
 			assert(p != 0);
@@ -589,12 +614,13 @@ struct AllocBackEnd
 				assert((char*)next >= b.buffer);
 
 				int last = *next;
+#ifdef DEBUG_ALLOC
 				if ((*next >= b.count) && (free_list[i].load() ==  curr))
 				{
 					while (true);
 					break;  // empty free list
 				}
-
+#endif
 				// another thread pulls item out of free list
 				// and inserts it again here..  *next would
 				// now be wrong, as the buffer has changed
@@ -602,22 +628,23 @@ struct AllocBackEnd
 				nxt.index = *next;
 				nxt.seq = curr.seq + 1;
 
+#ifdef DEBUG_ALLOC
 				if (nxt.index >= b.count)
 				{
 					while (free_list[i].load().index == curr.index);
 				}
-
+#endif
 				// if free_list changed, loop again
 				if (!free_list[i].compare_exchange_weak(curr, nxt)) continue;
 
+#ifdef DEBUG_ALLOC
 				if (nxt.index >= b.count)
 					while (true);
+#endif
 
 				if (b.MAX < nxt.index)
 				{
 					b.MAX = nxt.index;
-					if (i == 1)
-						printf("MX %d\n", b.MAX);
 				}
 
 				break;
@@ -638,7 +665,7 @@ struct AllocBackEnd
 			Buffer& b = m_buffer[i];
 
 			char* begin = b.buffer;
-			char* end = begin + b.count * b.size;  // end of allocated range
+			char* end = b.end; // begin + b.count * b.size;  // end of allocated range
 
 			// in allocated memory range?
 			if (ptr >= begin && ptr < end)
@@ -659,10 +686,10 @@ struct AllocBackEnd
 					// safe to update ptr, as no other thread
 					// should be accessing it right now
 					*(int*)ptr = next.index;
-
+#if 0
 					if (next.index >= b.count)
 						break;  // empty free list
-
+#endif
 					idx.seq = next.seq + 1;
 				} while (!free_list[i].compare_exchange_weak(next, idx));
 
@@ -739,10 +766,16 @@ public:
 			it != m_attrs.end();
 			it++)
 		{
+			if (it->value.data_type == AttributeType::type_string_view)
+			{
+				m_be.dealloc((char*)it->value.data.s.data);
+			}
+			/*
 			if (it->second.data_type == AttributeType::type_string_view)
 			{
 				m_be.dealloc((char*)it->second.data.s.data);
 			}
+			*/
 		}
 	}
 	virtual void set_timestamp(int64_t nsec)
@@ -776,9 +809,18 @@ public:
 		this->message = std::move(message);
 	}
 
-	virtual void add_attribute(const Span<const char>& key, const AttributeValue& attr)
+	virtual void add_attribute(const char* key, const AttributeValue& attr)
 	{
-		const auto& pair = this->m_attrs.emplace(key.data, attr);
+		this->m_attrs.emplace_back( NamedAttribute{ key, attr } );
+		if (attr.data_type == AttributeType::type_string_view)
+		{
+			NamedAttribute& back = m_attrs.back();
+			back.value.data.s.data = (char*)m_be.alloc(attr.data.s.len);
+			memcpy((char*)back.value.data.s.data, attr.data.s.data, attr.data.s.len);
+		}
+
+		/*
+		const auto& pair = this->m_attrs.emplace(key, attr);
 
 		// duplicate string, so it can go out of scope
 		if (attr.data_type == AttributeType::type_string_view)
@@ -787,6 +829,7 @@ public:
 			back.data.s.data = (char*)m_be.alloc(attr.data.s.len);
 			memcpy((char*)back.data.s.data, attr.data.s.data, attr.data.s.len);
 		}
+		*/
 	}
 
 	uint64_t    ts;
@@ -796,9 +839,12 @@ public:
 
 	typedef const char* key_type;
 
+	std::vector<NamedAttribute, Alloc<NamedAttribute> > m_attrs;
+	/*
 	std::unordered_map<key_type, AttributeValue,
 		std::hash<key_type>, std::equal_to<key_type>,
 		Alloc<std::pair<const key_type, AttributeValue>>> m_attrs;
+	*/
 };
 
 class NoAllocAttributeList : public AttributeList
@@ -848,7 +894,8 @@ public:
 		{
 			// grab local copy
 			uint64_t w = m_write;
-			if (size() >= m_capacity)
+			uint64_t r = m_read;
+			if ((w-r) >= m_capacity)
 			{
 				// drop oldest..				
 				return consume();
@@ -884,14 +931,23 @@ public:
 
 	T* consume()
 	{
-		std::lock_guard<std::mutex> lg(m_read_lock);
+		//std::lock_guard<std::mutex> lg(m_read_lock);
 
 		if (m_write == m_read)
 		{
 			return nullptr;
 		}
 
-		uint64_t index = m_read % m_capacity;
+		// increment m_read to ensure only this thread
+		// will modify this index
+		uint64_t r = m_read;
+		uint64_t index = r % m_capacity;
+		while (!m_read.compare_exchange_weak(r, r + 1))
+		{
+			r = m_read;
+			index = r % m_capacity;
+		}
+
 		T* exp = m_data[index];
 		while (!m_data[index].compare_exchange_weak(exp, nullptr) )
 		{
@@ -899,19 +955,28 @@ public:
 			exp = m_data[index];
 		}
 
-		// increment
-		m_read++;
 
 		return exp;
 	}
 
 	size_t size()
 	{
-		return m_write - m_read;
+		size_t diff;
+		uint64_t w;
+		do
+		{
+			w = m_write.load();
+			diff = w - m_read;
+
+			// if write changed, loop.  Its possible
+			// for write and read to update making
+			// m_read > w
+		} while (!m_write.compare_exchange_weak(w, w));
+		return diff;
 	}
-private:
 	std::atomic<uint64_t> m_read;
 	std::atomic<uint64_t> m_write;
+private:
 	size_t m_capacity;
 	std::atomic<T*>* m_data;
 
@@ -1066,6 +1131,7 @@ private:
 
 		std::vector<LogRecord*> vec;
 		size_t count = m_buffer.size(); // TODO: limit count to a max value?
+
 		vec.reserve(count); // resever the number of entries needed
 
 		for (size_t i = 0; i < count; i++)
@@ -1086,7 +1152,8 @@ private:
 				it != rec->m_attrs.end();
 				it++)
 			{
-				r->add_attribute(it->first, it->second);
+				//r->add_attribute(it->first, it->second);
+				r->add_attribute(it->name, it->value);
 			}
 
 			rec->~RecordType();
@@ -1202,7 +1269,7 @@ public:
 		clone(this->message, message);
 	}
 
-	virtual void add_attribute(const Span<const char>& key, const AttributeValue& attr)
+	virtual void add_attribute(const char* key, const AttributeValue& attr)
 	{
 		const auto& back = this->m_attrs.emplace(key, attr);
 		if (attr.data_type == AttributeType::type_string_view)

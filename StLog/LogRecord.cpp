@@ -30,7 +30,6 @@ void Logger::log(Severity sev, const char* msg, std::initializer_list<NamedAttri
 	if (pro == nullptr) return;
 	if (r == nullptr) return;
 
-
 	std::chrono::system_clock::time_point tp = std::chrono::system_clock::now();
 
 	// convert to nanoseconds.  System time is usually 100nsec
@@ -60,7 +59,7 @@ void Logger::log(Severity sev, const char* msg, std::initializer_list<NamedAttri
 	{
 		r->add_attribute(it->name, it->value);
 	}
-
+	
 	pro->add_record(r);
 }
 
