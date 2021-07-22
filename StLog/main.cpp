@@ -26,6 +26,15 @@ std::atomic<float> k2 = 0;
 LogProvider* pro = 0;
 
 std::atomic<int64_t> avg;
+
+CirculeBuffer<const char> cb(16);
+void CBThread(void*)
+{
+	while (true)
+	{
+		cb.consume();
+	}
+}
 void PushThread(void *arg)
 {
 	int loops = (int)arg;
@@ -151,6 +160,17 @@ int main()
 		.with_processor(&p)
 		;
 
+
+	/*
+	_beginthread(CBThread, 0, (void*)99999999);
+	_beginthread(CBThread, 0, (void*)99999999);
+	_beginthread(CBThread, 0, (void*)99999999);
+	while (true)
+	{
+		cb.add("");
+	}
+	Sleep(10000);
+	*/
 
 	//PushThread((void*)1000);
 	_beginthread(PushThread, 0, (void*)99999999);
