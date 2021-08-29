@@ -6,9 +6,8 @@
 #include <Windows.h>
 #endif
 
-#include <process.h>
+#include <thread>
 #include "LogRecord.h"
-#include <process.h>
 #include <iostream>
 #include <string>
 
@@ -176,9 +175,9 @@ int main()
 	*/
 
 	//PushThread((void*)1000);
-	_beginthread(PushThread, 0, (void*)99999999);
-	_beginthread(PushThread, 0, (void*)99999999);
-	_beginthread(PushThread, 0, (void*)99999999);
+	std::thread(PushThread, 0, (void*)99999999);
+	std::thread(PushThread, 0, (void*)99999999);
+	std::thread(PushThread, 0, (void*)99999999);
 
 	for (int i = 0; i < 20; i++)
 	{
