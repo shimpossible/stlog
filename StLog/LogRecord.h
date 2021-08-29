@@ -7,6 +7,7 @@
 #include <string.h>
 #include <vector>
 #include <condition_variable>
+#include <thread>
 
 enum class Severity : uint16_t
 {
