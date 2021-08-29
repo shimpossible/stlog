@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string.h>
 #include <vector>
+#include <condition_variable>
 
 enum class Severity : uint16_t
 {
@@ -142,15 +143,11 @@ enum class AttributeType : uint8_t
 // helper to tell the difference between long and long long types
 // on various platforms
 template<size_t N, bool SIGNED = false>
-AttributeType get_attr_type()
-{
-    static_assert((N != 4) && (N != 8), "unsupported type");
-}
-template<> AttributeType get_attr_type<8, false>() { return AttributeType::type_u64; }
-template<> AttributeType get_attr_type<8, true>() { return AttributeType::type_s64; }
-template<> AttributeType get_attr_type<4, false>() { return AttributeType::type_u32; }
-template<> AttributeType get_attr_type<4, true>() { return AttributeType::type_s32; }
-
+struct get_attr_type {};
+template<> struct get_attr_type<8, false> { static const AttributeType value = AttributeType::type_u64; };
+template<> struct get_attr_type<8, true>  { static const AttributeType value = AttributeType::type_s64; };
+template<> struct get_attr_type<4, false> { static const AttributeType value = AttributeType::type_u32; };
+template<> struct get_attr_type<4, true>  { static const AttributeType value = AttributeType::type_s32; };
 
 class AttributeValue
 {
@@ -204,25 +201,25 @@ public:
     AttributeValue(unsigned long val)
     {
         data.u64 = val;
-        data_type = get_attr_type<sizeof(val), false>();
+        data_type = get_attr_type<sizeof(val), false>::value;
     }
 
     AttributeValue(unsigned long long val)
     {
         data.u64 = val;
-        data_type = get_attr_type<sizeof(val), false>();
+        data_type = get_attr_type<sizeof(val), false>::value;
     }
 
     AttributeValue(signed long val)
     {
         data.u64 = val;
-        data_type = get_attr_type<sizeof(val), true>();
+        data_type = get_attr_type<sizeof(val), true>::value;
     }
 
     AttributeValue(signed long long val)
     {
         data.u64 = val;
-        data_type = get_attr_type<sizeof(val), true>();
+        data_type = get_attr_type<sizeof(val), true>::value;
     }
 
     AttributeValue(int8_t val)
@@ -1012,11 +1009,19 @@ public:
 
     struct Options
     {
-        size_t  buffer_size = 128;		//!< Size of ring buffer in entries
-        size_t  threshold   = 64;		//!< how full buffer should be, before forced flush
+        size_t  buffer_size;	//!< Size of ring buffer in entries
+        size_t  threshold;		//!< how full buffer should be, before forced flush
         //! max time between flushes of buffer
-        const std::chrono::milliseconds timeout = std::chrono::milliseconds(100);
+        std::chrono::milliseconds timeout;
+
+        Options()
+        {
+            buffer_size = 128;
+            threshold = 64;
+            timeout = std::chrono::milliseconds(100);
+        }
     };
+
     NoAllocLogProcessor(LogProvider& p, AllocBackEnd& be, const Options& opt = {})
     : m_be(be)
     , m_alloc(be)
