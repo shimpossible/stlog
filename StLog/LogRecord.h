@@ -4,6 +4,7 @@
 #include <atomic>
 #include <assert.h>
 #include <mutex>
+#include <string.h>
 
 enum class Severity : uint16_t
 {
@@ -185,27 +186,41 @@ public:
         data_type = AttributeType::type_u32;
     }
 
-    AttributeValue(uint64_t val)
+
+    // helper to tell the difference between long and long long types
+    // on various platforms
+    template<size_t N, bool SIGNED=false>
+    static AttributeType get_type()
     {
-        data.u64 = val;
-        data_type = AttributeType::type_u64;
+        static_assert((N != 4) && (N != 8), "unsupported type");
     }
+    template<> static AttributeType get_type<8, false>(){ return AttributeType::type_u64;}
+    template<> static AttributeType get_type<8, true>() { return AttributeType::type_s64; }
+    template<> static AttributeType get_type<4, false>() { return AttributeType::type_u32; }
+    template<> static AttributeType get_type<4, true>() { return AttributeType::type_s32; }
 
     AttributeValue(unsigned long val)
     {
         data.u64 = val;
-        data_type = (sizeof(val) == 8) 
-                  ? AttributeType::type_u64
-                  : AttributeType::type_u32
-                  ;
+        data_type = get_type<sizeof(val), false>();
     }
-    AttributeValue(long val)
+
+    AttributeValue(unsigned long long val)
     {
         data.u64 = val;
-        data_type = (sizeof(val) == 8)
-            ? AttributeType::type_s64
-            : AttributeType::type_s32
-            ;
+        data_type = get_type<sizeof(val), false>();
+    }
+
+    AttributeValue(signed long val)
+    {
+        data.u64 = val;
+        data_type = get_type<sizeof(val), true>();
+    }
+
+    AttributeValue(signed long long val)
+    {
+        data.u64 = val;
+        data_type = get_type<sizeof(val), true>();
     }
 
     AttributeValue(int8_t val)
@@ -224,12 +239,6 @@ public:
     {
         data.s32 = val;
         data_type = AttributeType::type_s32;
-    }
-
-    AttributeValue(int64_t val)
-    {
-        data.s64 = val;
-        data_type = AttributeType::type_s64;
     }
 
     AttributeValue(bool val)

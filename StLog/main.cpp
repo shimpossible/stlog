@@ -154,7 +154,7 @@ int main()
 	*/
 
 	FILE* f;
-	fopen_s(&f, "log.txt", "w");
+	f = fopen("log.txt", "w");
 	pro = new LogProvider();
 	PrintfLogExporter  ex(stdout);
 	NoAllocLogProcessor p(*pro, be);
