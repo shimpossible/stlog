@@ -6,6 +6,7 @@
 #include <Windows.h>
 #endif
 
+#include <chrono>
 #include <thread>
 #include "LogRecord.h"
 #include <iostream>
@@ -44,7 +45,7 @@ void PushThread(void *arg)
 
 	for(int k=0;k<loops;k++)
 	{
-		AttributeValue val(GetCurrentThreadId());
+		AttributeValue val(0);// GetCurrentThreadId());
 		LogScope scope = logger.begin_scope({
 			{"file.name", __FILE__},
 			{"file.line", (int)__LINE__},
@@ -175,16 +176,18 @@ int main()
 	*/
 
 	//PushThread((void*)1000);
-	std::thread(PushThread, 0, (void*)99999999);
-	std::thread(PushThread, 0, (void*)99999999);
-	std::thread(PushThread, 0, (void*)99999999);
+	auto t1 = std::thread(PushThread,(void*)99999999);
+	auto t2 = std::thread(PushThread,(void*)99999999);
+	auto t3 = std::thread(PushThread,(void*)99999999);
 
+	std::chrono::seconds sleep_time(1);
 	for (int i = 0; i < 20; i++)
 	{
-		Sleep(1000);
+		std::this_thread::sleep_for(sleep_time);
 		printf("%llu\n", avg.load());
 	}
-	Sleep(10000);
+
+	std::this_thread::sleep_for(sleep_time*10);
 
 	pro->with_processor(nullptr);
 }

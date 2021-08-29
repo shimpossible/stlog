@@ -4,7 +4,6 @@
 #include <atomic>
 #include <assert.h>
 #include <mutex>
-#include <Windows.h>
 
 enum class Severity : uint16_t
 {
