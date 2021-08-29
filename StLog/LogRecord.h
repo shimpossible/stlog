@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <mutex>
 #include <string.h>
+#include <vector>
 
 enum class Severity : uint16_t
 {
@@ -137,6 +138,20 @@ enum class AttributeType : uint8_t
     type_string_view,   // pointer to existing memory
 };
 
+
+// helper to tell the difference between long and long long types
+// on various platforms
+template<size_t N, bool SIGNED = false>
+AttributeType get_attr_type()
+{
+    static_assert((N != 4) && (N != 8), "unsupported type");
+}
+template<> AttributeType get_attr_type<8, false>() { return AttributeType::type_u64; }
+template<> AttributeType get_attr_type<8, true>() { return AttributeType::type_s64; }
+template<> AttributeType get_attr_type<4, false>() { return AttributeType::type_u32; }
+template<> AttributeType get_attr_type<4, true>() { return AttributeType::type_s32; }
+
+
 class AttributeValue
 {
 public:
@@ -186,41 +201,28 @@ public:
         data_type = AttributeType::type_u32;
     }
 
-
-    // helper to tell the difference between long and long long types
-    // on various platforms
-    template<size_t N, bool SIGNED=false>
-    static AttributeType get_type()
-    {
-        static_assert((N != 4) && (N != 8), "unsupported type");
-    }
-    template<> static AttributeType get_type<8, false>(){ return AttributeType::type_u64;}
-    template<> static AttributeType get_type<8, true>() { return AttributeType::type_s64; }
-    template<> static AttributeType get_type<4, false>() { return AttributeType::type_u32; }
-    template<> static AttributeType get_type<4, true>() { return AttributeType::type_s32; }
-
     AttributeValue(unsigned long val)
     {
         data.u64 = val;
-        data_type = get_type<sizeof(val), false>();
+        data_type = get_attr_type<sizeof(val), false>();
     }
 
     AttributeValue(unsigned long long val)
     {
         data.u64 = val;
-        data_type = get_type<sizeof(val), false>();
+        data_type = get_attr_type<sizeof(val), false>();
     }
 
     AttributeValue(signed long val)
     {
         data.u64 = val;
-        data_type = get_type<sizeof(val), true>();
+        data_type = get_attr_type<sizeof(val), true>();
     }
 
     AttributeValue(signed long long val)
     {
         data.u64 = val;
-        data_type = get_type<sizeof(val), true>();
+        data_type = get_attr_type<sizeof(val), true>();
     }
 
     AttributeValue(int8_t val)
