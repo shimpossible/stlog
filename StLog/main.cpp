@@ -20,8 +20,8 @@ AllocBackEnd be({
 	{128, 512,  (char*)malloc(128 * 512) },
 	{256, 512,  (char*)malloc(256 * 512) },
 });
-std::atomic<int> i = 0;
-std::atomic<float> k2 = 0;
+std::atomic<int> i(0);
+std::atomic<float> k2(0);
 
 LogProvider* pro = 0;
 
@@ -37,13 +37,13 @@ void CBThread(void*)
 }
 void PushThread(void *arg)
 {
-	int loops = (int)arg;
+	size_t loops = (size_t)arg;
 	Logger& logger = pro->get("test");
 	Logger& log2 = pro->get("log2");
 
 	volatile char buff[1024];
 
-	for(int k=0;k<loops;k++)
+	for(size_t k=0;k<loops;k++)
 	{
 		AttributeValue val(0);// GetCurrentThreadId());
 		LogScope scope = logger.begin_scope({
