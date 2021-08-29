@@ -1,14 +1,14 @@
-//#ifdef _DEBUG
+#ifdef WIN32
 #define _CRTDBG_MAP_ALLOC
 #define _CRTDBG_MAP_ALLOC_NEW
 #include <crtdbg.h>
 #include <assert.h>
-//#endif
+#include <Windows.h>
+#endif
 
 #include <process.h>
 #include "LogRecord.h"
 #include <process.h>
-#include <Windows.h>
 #include <iostream>
 #include <string>
 
@@ -115,6 +115,7 @@ int main()
 {
 	AttributeValue v(0);
 
+#ifdef WIN32
 	/*
 	_CrtSetDbgFlag(_CRTDBG_REPORT_FLAG
 	| _CRTDBG_LEAK_CHECK_DF
@@ -134,7 +135,7 @@ int main()
 		| _CRTDBG_CHECK_ALWAYS_DF
 		| _CRTDBG_CHECK_CRT_DF
 	    | _CRTDBG_REPORT_FLAG);
-
+#endif
 
 	AttributeValue av(0);
 	//std::pair<int, AttributeValue> pair(1, av);
@@ -143,11 +144,13 @@ int main()
 
 	/*
 	* // Check for leaks
+	#ifdef WIN32
 	_CrtMemState state, state2;
 	_CrtMemCheckpoint(&state);
 	PushThread(1000);
 	_CrtMemCheckpoint(&state2);
 	_CrtMemDumpAllObjectsSince(&state);
+	#endif
 	*/
 
 	FILE* f;
